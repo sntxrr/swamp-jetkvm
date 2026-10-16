@@ -135,7 +135,7 @@ Hourly is reasonable. Alert on `verdict != "ok"` and on the age of the latest
 
 ```bash
 ~/.swamp/deno/deno check jetkvm.ts
-~/.swamp/deno/deno test --allow-read --allow-env --allow-write jetkvm_test.ts
+~/.swamp/deno/deno test --allow-read --allow-env --allow-write --allow-run=sh jetkvm_test.ts
 ```
 
 The tests run against a scripted fake device through `transportFactory`. They
