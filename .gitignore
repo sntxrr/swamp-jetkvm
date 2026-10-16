@@ -1,0 +1,27 @@
+# BEGIN swamp managed section - DO NOT EDIT
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# Claude Code configuration (managed by swamp)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+# END swamp managed section
+
+# --- site-specific, not part of the publishable extension ---
+# Model instances carry real KVM addresses, host keys and vault references for
+# a real fleet. This repo is PUBLIC; the README documents the shape with
+# fictional devices instead.
+/models/
+# Vault definitions point at local paths (secrets themselves live in .swamp/).
+/vaults/
+/grants/
+/workflows/
+# .swamp.yaml carries repo-local state (repoId, and a datastore block if one is
+# ever added, which names a bucket). Only the example is tracked.
+.swamp.yaml
