@@ -149,6 +149,10 @@ async function run(
   stdin: Uint8Array,
   timeoutMs: number,
 ): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+  // Only `ssh` and `curl`, with argv built from schema-validated globals
+  // (sshArgs, device): there is no swamp primitive for SSH, and the device's
+  // self-signed TLS needs curl.
+  // swamp-quality-ignore deno-command
   const child = new Deno.Command(cmd, {
     args,
     stdin: "piped",
