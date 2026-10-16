@@ -14,12 +14,15 @@ import {
   model,
   parseMetrics,
   parseProbe,
+  parseSwapState,
   type Probe,
   PROBE_END,
+  PROBE_SCRIPT,
   rejoinPoll,
   rollbackScript,
   sshArgs,
   type SshResult,
+  SWAP_STATE_SCRIPT,
   swapScript,
   type Transport,
   transportFactory,
@@ -101,6 +104,7 @@ function probeText(over: Record<string, string> = {}, end = true): string {
     ts_online: "true",
     ts_ip: "198.51.100.7",
     ts_dns: "kvm-a.example.ts.net.",
+    boot_id: "boot-1",
     ...over,
   };
   return Object.entries(kv).map(([k, v]) => `${k}=${v}`).join("\n") +
@@ -235,25 +239,122 @@ function assertRejectsSync(fn: () => unknown) {
 }
 
 // ---------------------------------------------------------------------------
+// Generated shell
+// ---------------------------------------------------------------------------
+
+async function shSyntax(script: string): Promise<string> {
+  const child = new Deno.Command("sh", {
+    args: ["-n"],
+    stdin: "piped",
+    stdout: "null",
+    stderr: "piped",
+  }).spawn();
+  const w = child.stdin.getWriter();
+  await w.write(enc(script));
+  await w.close();
+  const out = await child.output();
+  return out.code === 0 ? "" : dec(out.stderr);
+}
+
+Deno.test("every generated script parses as sh", async () => {
+  for (
+    const [name, script] of [
+      ["probe", PROBE_SCRIPT],
+      ["swap", swapScript("1.104.1", "1.98.8")],
+      ["rollback", rollbackScript("1.98.8")],
+      ["swap state", SWAP_STATE_SCRIPT],
+    ]
+  ) assertEquals(await shSyntax(script), "", `${name} script: syntax error`);
+});
+
+Deno.test("the swap script records its pid and status, cleans up and restarts the daemon on any exit", () => {
+  const s = swapScript("1.104.1", "1.98.8");
+  assertStringIncludes(s, "echo $$ > /userdata/tailscale-update.pid");
+  assertStringIncludes(s, "trap finish EXIT");
+  assertStringIncludes(s, "> /userdata/tailscale-update.status");
+  assertStringIncludes(
+    s,
+    "pidof tailscaled >/dev/null 2>&1 || /userdata/init.d/S22tailscale start",
+  );
+  // atomic backup: a half-copied backup is never mistaken for a complete one
+  assertStringIncludes(
+    s,
+    "mv /userdata/tailscale/backup-1.98.8.tmp /userdata/tailscale/backup-1.98.8",
+  );
+  assert(s.indexOf("trap finish EXIT") < s.indexOf("set -e"));
+  const r = rollbackScript("1.98.8");
+  assert(
+    r.indexOf("backup-1.98.8/tailscale ]") < r.indexOf("S22tailscale stop"),
+    "the rollback checks both binaries before stopping anything",
+  );
+  assertStringIncludes(r, "trap 'pidof tailscaled");
+});
+
+Deno.test("parseSwapState reads each state and treats missing output as unknown", () => {
+  const mk = (head: string, log = "") => `${head}\n---\n${log}\n${PROBE_END}\n`;
+  assertEquals(parseSwapState(mk("state=running")).state, "running");
+  const ex = parseSwapState(mk("state=exited 3", "x tarball lacks binaries"));
+  assertEquals([ex.state, ex.exitCode], ["exited", 3]);
+  assertStringIncludes(ex.log, "tarball lacks binaries");
+  assertEquals(parseSwapState(mk("state=none")).state, "none");
+  assertEquals(parseSwapState(null).state, "unknown");
+  assertEquals(
+    parseSwapState("state=exited 0\n---\n").state,
+    "unknown",
+    "no end marker",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Scripted device
 // ---------------------------------------------------------------------------
 
 const TGZ = enc("fake tarball bytes");
 const WRONG_SHA = "0".repeat(64);
+const OLD = "1.98.8";
+const NEW = "1.104.1";
 
+async function hex(b: Uint8Array): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new Uint8Array(b));
+  return Array.from(new Uint8Array(d)).map((x) =>
+    x.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+/**
+ * A JetKVM as the model sees it. It acts like sh where that matters: a
+ * backgrounded `cat` gets no stdin, an empty script does nothing, the swap is
+ * asynchronous, and sha256sum hashes what actually arrived.
+ */
 class FakeJetKvm implements Transport {
   sshLog: { command: string; stdin: string }[] = [];
   fetchLog: string[] = [];
-  tsVersion = "1.98.8";
+  tsVersion = OLD;
   online = true;
   uptime = 5000;
-  /** What a reboot does: "ok" comes back, "dead" never answers, "noboot" loses Tailscale, "ignored" never reboots. */
+  bootId = "boot-1";
+  /** ok: swaps and rejoins. stuck: swaps, never online. slow: running for `slowProbes` probes, then ok. hang: running forever. noop: exits 3 before swapping. */
+  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" = "ok";
+  slowProbes = 0;
+  launchCode = 0;
+  rollbackWorks = true;
+  /** ok: reboots and comes back. dead: never answers again. noboot: back without Tailscale online. ignored: no reboot happens. */
   rebootOutcome: "ok" | "dead" | "noboot" | "ignored" = "ok";
+  rebootCode = 0;
+  corruptUpload = false;
   rebooted = false;
   script = "";
-  /** What the swap does to the device: "ok" joins, "stuck" never rejoins. */
-  swapOutcome: "ok" | "stuck" = "ok";
-  sha = "";
+  swap: {
+    state: "none" | "running" | "exited";
+    code: number | null;
+    log: string;
+  } = {
+    state: "none",
+    code: null,
+    log: "",
+  };
+  pending = 0;
+
   constructor(
     private opts: {
       httpDown?: boolean;
@@ -279,88 +380,116 @@ class FakeJetKvm implements Transport {
     });
   }
 
-  ssh(command: string, stdin?: Uint8Array): Promise<SshResult> {
-    this.sshLog.push({ command, stdin: stdin ? dec(stdin) : "" });
+  private ok(stdout = ""): SshResult {
+    return { code: 0, stdout, stderr: "" };
+  }
+
+  private finishSwap() {
+    this.tsVersion = NEW;
+    if (this.swapPlan === "stuck") this.online = false;
+    this.swap = {
+      state: "exited",
+      code: 0,
+      log: "backup ready\nbinaries swapped\nSWAP_DONE",
+    };
+  }
+
+  async ssh(command: string, stdin?: Uint8Array): Promise<SshResult> {
+    const input = stdin ? dec(stdin) : "";
+    this.sshLog.push({ command, stdin: input });
     if (this.opts.sshDown) {
-      return Promise.resolve({
+      return {
         code: 255,
         stdout: "",
         stderr: "Permission denied (publickey).",
-      });
+      };
     }
-    if (command === "sh -s" && stdin && dec(stdin).includes(PROBE_END)) {
+    if (command === "sh -s" && input === PROBE_SCRIPT) {
       if (this.rebooted && this.rebootOutcome === "dead") {
-        return Promise.resolve({
-          code: 255,
-          stdout: "",
-          stderr: "Connection refused",
-        });
+        return { code: 255, stdout: "", stderr: "Connection refused" };
+      }
+      if (
+        this.swap.state === "running" && this.swapPlan === "slow" &&
+        --this.pending <= 0
+      ) {
+        this.finishSwap();
       }
       this.uptime += 1;
-      return Promise.resolve({
-        code: 0,
-        stdout: probeText(
-          {
-            ts_version: this.tsVersion,
-            ts_online: String(this.online),
-            uptime: String(this.uptime),
-            ...this.opts.probeOver,
-          },
-          !this.opts.truncated,
-        ),
-        stderr: "",
-      });
+      return this.ok(probeText(
+        {
+          ts_version: this.tsVersion,
+          ts_online: String(this.online),
+          uptime: String(this.uptime),
+          boot_id: this.bootId,
+          ...this.opts.probeOver,
+        },
+        !this.opts.truncated,
+      ));
     }
-    if (
-      command.startsWith("cat > /userdata/tailscale-") &&
-      command.includes("sha256sum")
-    ) {
-      return Promise.resolve({
-        code: 0,
-        stdout: `${this.sha}  /userdata/x.tgz\n`,
-        stderr: "",
-      });
+    if (command === "sh -s" && input === SWAP_STATE_SCRIPT) {
+      const head = this.swap.state === "exited"
+        ? `state=exited ${this.swap.code}`
+        : `state=${this.swap.state}`;
+      return this.ok(`${head}\n---\n${this.swap.log}\n${PROBE_END}\n`);
+    }
+    if (command === "sh -s" && input.includes("ROLLBACK_DONE")) {
+      if (!this.rollbackWorks) {
+        return { code: 3, stdout: "no complete backup", stderr: "" };
+      }
+      this.tsVersion = OLD;
+      this.online = true;
+      return this.ok("ROLLBACK_DONE\n");
+    }
+    if (command.startsWith(`cat > /userdata/tailscale-${NEW}.tgz`)) {
+      const body = this.corruptUpload
+        ? enc("truncated")
+        : stdin ?? new Uint8Array();
+      return this.ok(`${await hex(body)}  /userdata/x.tgz\n`);
+    }
+    if (command.includes("cat > /userdata/tailscale-update.sh")) {
+      // Like sh: a backgrounded list gets /dev/null as stdin.
+      this.script = command.trimEnd().endsWith("&") ? "" : input;
+      return this.ok(
+        command.includes("wc -c") ? `${enc(this.script).length}\n` : "",
+      );
+    }
+    if (command.includes("nohup sh /userdata/tailscale-update.sh")) {
+      // An empty script runs nothing and leaves no pid or status behind.
+      if (this.script.includes("binaries swapped")) {
+        if (this.swapPlan === "noop") {
+          this.swap = {
+            state: "exited",
+            code: 3,
+            log: "tarball lacks binaries",
+          };
+        } else if (this.swapPlan === "slow" || this.swapPlan === "hang") {
+          this.swap = { state: "running", code: null, log: "backup ready" };
+          this.pending = this.slowProbes;
+        } else this.finishSwap();
+      }
+      return {
+        code: this.launchCode,
+        stdout: "",
+        stderr: this.launchCode ? "Connection reset" : "",
+      };
     }
     if (command.includes("reboot")) {
+      if (this.rebootCode !== 0) {
+        return {
+          code: this.rebootCode,
+          stdout: "",
+          stderr: "reboot: not permitted",
+        };
+      }
       if (this.rebootOutcome !== "ignored") {
         this.rebooted = true;
+        this.bootId = "boot-2";
         this.uptime = 10;
       }
       if (this.rebootOutcome === "noboot") this.online = false;
-      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      return this.ok();
     }
-    if (command.startsWith("cat > /userdata/tailscale-update.sh")) {
-      // Like sh: a backgrounded list gets /dev/null as stdin.
-      this.script = command.trimEnd().endsWith("&")
-        ? ""
-        : (stdin ? dec(stdin) : "");
-      return Promise.resolve({
-        code: 0,
-        stdout: command.includes("wc -c") ? `${enc(this.script).length}\n` : "",
-        stderr: "",
-      });
-    }
-    if (command.includes("nohup sh /userdata/tailscale-update.sh")) {
-      if (!this.script.includes("binaries swapped")) {
-        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-      }
-      if (this.swapOutcome === "ok") this.tsVersion = "1.104.1";
-      else {
-        this.tsVersion = "1.104.1";
-        this.online = false;
-      }
-      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-    }
-    if (command === "sh -s" && stdin && dec(stdin).includes("ROLLBACK_DONE")) {
-      this.tsVersion = "1.98.8";
-      this.online = true;
-      return Promise.resolve({
-        code: 0,
-        stdout: "ROLLBACK_DONE\n",
-        stderr: "",
-      });
-    }
-    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    return this.ok();
   }
 
   async fetch(url: string): Promise<HttpResult> {
@@ -368,7 +497,7 @@ class FakeJetKvm implements Transport {
     if (url.startsWith("https://pkgs.tailscale.com/stable/?mode=json")) {
       return {
         status: 200,
-        body: enc(JSON.stringify({ TarballsVersion: "1.104.1" })),
+        body: enc(JSON.stringify({ TarballsVersion: NEW })),
       };
     }
     if (url.startsWith("https://api.jetkvm.com/releases")) {
@@ -380,12 +509,10 @@ class FakeJetKvm implements Transport {
       };
     }
     if (url.endsWith(".tgz.sha256")) {
-      const d = await crypto.subtle.digest("SHA-256", TGZ);
-      const hex = Array.from(new Uint8Array(d)).map((b) =>
-        b.toString(16).padStart(2, "0")
-      ).join("");
-      this.sha = hex;
-      return { status: 200, body: enc(this.opts.badSum ? WRONG_SHA : hex) };
+      return {
+        status: 200,
+        body: enc(this.opts.badSum ? WRONG_SHA : await hex(TGZ)),
+      };
     }
     if (url.endsWith(".tgz")) return { status: 200, body: TGZ };
     return { status: 404, body: enc("") };
@@ -433,7 +560,7 @@ Deno.test("health on a current device: warn only for the Tailscale update, and n
   const d = await runHealth(fake);
   assertEquals(d.verdict, "warn");
   assertEquals(d.appVersion, "0.5.9");
-  assertEquals(d.latestTailscale, "1.104.1");
+  assertEquals(d.latestTailscale, NEW);
   assert(d.findings.some((f: any) => f.code === "tailscale_update_available"));
   assertEquals(
     fake.sshLog.map((l) => l.command),
@@ -471,7 +598,7 @@ Deno.test("health records a fully unreachable device as fail with both findings"
 
 Deno.test("health with SSH up and HTTP down is at least warn", async () => {
   const fake = new FakeJetKvm({ httpDown: true });
-  fake.tsVersion = "1.104.1";
+  fake.tsVersion = NEW;
   const d = await runHealth(fake);
   assertEquals(d.verdict, "warn");
   assertEquals(d.findings[0].code, "web_unreachable");
@@ -494,29 +621,46 @@ const runTs = (fake: FakeJetKvm, a: Record<string, unknown>) => {
   return { p, written: () => getWrittenResources().map((w) => w.data as any) };
 };
 
+/** Everything sent to the device except the read-only probe and swap-state reads. */
 const deviceWrites = (fake: FakeJetKvm) =>
   fake.sshLog.filter((l) =>
-    !(l.command === "sh -s" && l.stdin.includes(PROBE_END))
+    !(l.command === "sh -s" &&
+      (l.stdin === PROBE_SCRIPT || l.stdin === SWAP_STATE_SCRIPT))
   );
+const sent = (fake: FakeJetKvm, needle: string) =>
+  deviceWrites(fake).some((l) =>
+    l.command.includes(needle) || l.stdin.includes(needle)
+  );
+
+const APPLY = { action: "update", apply: true, rejoinTimeoutMs: 40 };
+
+async function applied(fake: FakeJetKvm, extra: Record<string, unknown> = {}) {
+  const r = runTs(fake, { ...APPLY, ...extra });
+  let error: Error | null = null;
+  await r.p.catch((e) => (error = e));
+  const [w] = r.written();
+  model.resources.tailscale.schema.parse(w);
+  return { w, error: error as Error | null };
+}
 
 Deno.test("tailscale status reports the version and the available update, touching nothing", async () => {
   const fake = new FakeJetKvm();
-  const { p, written } = await runTs(fake, {});
+  const { p, written } = runTs(fake, {});
   await p;
   const [w] = written();
   model.resources.tailscale.schema.parse(w);
   assertEquals(w.outcome, "status");
-  assertStringIncludes(w.message, "1.104.1 is available");
+  assertStringIncludes(w.message, `${NEW} is available`);
   assertEquals(deviceWrites(fake).length, 0);
 });
 
 Deno.test("tailscale update without apply is a dry run listing every step", async () => {
   const fake = new FakeJetKvm();
-  const { p, written } = await runTs(fake, { action: "update" });
+  const { p, written } = runTs(fake, { action: "update" });
   await p;
   const [w] = written();
   assertEquals(w.outcome, "dry-run");
-  assertEquals(w.targetVersion, "1.104.1");
+  assertEquals(w.targetVersion, NEW);
   assertEquals(w.steps.length, 5);
   assertEquals(
     deviceWrites(fake).length,
@@ -529,77 +673,165 @@ Deno.test("tailscale update without apply is a dry run listing every step", asyn
   );
 });
 
-Deno.test("tailscale update applies: verify, upload, swap, and confirm the same node rejoined", async () => {
+Deno.test("tailscale update applies: verify, upload, write, launch, confirm the same node rejoined", async () => {
   const fake = new FakeJetKvm();
-  const { p, written } = await runTs(fake, { action: "update", apply: true });
-  await p;
-  const [w] = written();
-  model.resources.tailscale.schema.parse(w);
+  const { w, error } = await applied(fake);
+  assertEquals(error, null);
   assertEquals(w.outcome, "done");
-  assertEquals(w.after.version, "1.104.1");
+  assertEquals(w.after.version, NEW);
   assertEquals(w.after.ip, "198.51.100.7");
-  const cmds = deviceWrites(fake).map((l) => l.command);
-  assert(cmds[0].startsWith("cat > /userdata/tailscale-1.104.1.tgz"));
-  assertEquals(deviceWrites(fake)[0].stdin, dec(TGZ));
-  assert(cmds[1].startsWith("cat > /userdata/tailscale-update.sh"));
+  const writes = deviceWrites(fake);
+  assert(writes[0].command.startsWith(`cat > /userdata/tailscale-${NEW}.tgz`));
+  assertEquals(writes[0].stdin, dec(TGZ));
+  assertStringIncludes(
+    writes[1].command,
+    "cat > /userdata/tailscale-update.sh && wc -c",
+  );
+  assertStringIncludes(
+    writes[1].command,
+    "rm -f /userdata/tailscale-update.pid /userdata/tailscale-update.status /userdata/tailscale-update.log",
+  );
   assert(
-    !cmds[1].trimEnd().endsWith("&"),
+    !writes[1].command.trimEnd().endsWith("&"),
     "the script write must not be backgrounded",
   );
-  assertStringIncludes(deviceWrites(fake)[1].stdin, "backup-1.98.8");
-  assertStringIncludes(cmds[2], "nohup sh /userdata/tailscale-update.sh");
-  assertStringIncludes(cmds[2], "< /dev/null");
+  assertStringIncludes(writes[1].stdin, `backup-${OLD}`);
+  assertStringIncludes(
+    writes[2].command,
+    "nohup sh /userdata/tailscale-update.sh",
+  );
+  assertStringIncludes(writes[2].command, "< /dev/null");
+  assertEquals(writes.length, 3);
 });
 
 Deno.test("tailscale update refuses a tarball whose sha256 does not match, before touching the device", async () => {
   const fake = new FakeJetKvm({ badSum: true });
-  const { p, written } = await runTs(fake, { action: "update", apply: true });
-  await assertRejects(() => p, Error, "sha256 mismatch");
-  assertEquals(written()[0].outcome, "refused");
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "sha256 mismatch");
+  assertEquals(w.outcome, "refused");
   assertEquals(deviceWrites(fake).length, 0);
 });
 
-Deno.test("tailscale update rolls back when the node does not come back online", async () => {
+Deno.test("tailscale update refuses an upload that arrives altered, and removes it", async () => {
   const fake = new FakeJetKvm();
-  fake.swapOutcome = "stuck";
-  const { p, written } = await runTs(fake, {
-    action: "update",
-    apply: true,
-    rejoinTimeoutMs: 30,
-  });
-  await assertRejects(() => p, Error, "rolled back");
-  const [w] = written();
+  fake.corruptUpload = true;
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "did not verify");
+  assertEquals(w.outcome, "refused");
+  assert(sent(fake, `rm -f /userdata/tailscale-${NEW}.tgz`));
+  assert(!sent(fake, "nohup"));
+});
+
+Deno.test("tailscale update rolls back when the swapped node does not come back online", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "rolled back");
   assertEquals(w.outcome, "rolled-back");
-  assertEquals(w.after.version, "1.98.8");
-  assert(deviceWrites(fake).some((l) => l.stdin.includes("ROLLBACK_DONE")));
+  assertEquals(w.after.version, OLD);
+  assert(sent(fake, "ROLLBACK_DONE"));
+});
+
+Deno.test("a failed rollback is recorded as rollback-failed, not rolled-back", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  fake.rollbackWorks = false;
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "rollback failed");
+  assertEquals(w.outcome, "rollback-failed");
+  assertStringIncludes(w.message, "NEEDS A HUMAN");
+});
+
+Deno.test("a swap still running at the deadline is waited for, not misread as unchanged", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "slow";
+  fake.slowProbes = 60; // well past rejoinTimeoutMs at 1 ms polling, inside 2x
+  const { w, error } = await applied(fake, { rejoinTimeoutMs: 400 });
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
+  assert(!sent(fake, "ROLLBACK_DONE"));
+});
+
+Deno.test("a swap that never finishes is swap-unconfirmed, and nothing races it", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "hang";
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "unconfirmed");
+  assertEquals(w.outcome, "swap-unconfirmed");
+  assert(
+    !sent(fake, "ROLLBACK_DONE"),
+    "no rollback while the swap may still act",
+  );
+});
+
+Deno.test("a swap that exits before swapping is unchanged, applied false, with no rollback", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "noop";
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "device unchanged");
+  assertEquals(w.outcome, "unchanged");
+  assertEquals(w.applied, false);
+  assertStringIncludes(w.message, "tarball lacks binaries");
+  assert(!sent(fake, "ROLLBACK_DONE"));
+});
+
+Deno.test("a launch whose session drops after the job started is still watched to the end", async () => {
+  const fake = new FakeJetKvm();
+  fake.launchCode = 255;
+  const { w, error } = await applied(fake);
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
+});
+
+Deno.test("a launch that failed with no trace on the device is refused and cleaned up", async () => {
+  const fake = new FakeJetKvm();
+  fake.launchCode = 255;
+  fake.swapPlan = "ok";
+  // the script never lands as runnable, so the launch leaves no pid or status
+  const orig = fake.ssh.bind(fake);
+  fake.ssh = (c: string, i?: Uint8Array) =>
+    c.includes("nohup")
+      ? Promise.resolve({ code: 255, stdout: "", stderr: "Connection reset" })
+      : orig(c, i);
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "could not start the swap");
+  assertEquals(w.outcome, "refused");
+  assert(
+    sent(
+      fake,
+      "rm -f /userdata/tailscale-1.104.1.tgz /userdata/tailscale-update.sh",
+    ),
+  );
 });
 
 Deno.test("tailscale update is a no-op when already current, and refuses downgrades", async () => {
   const cur = new FakeJetKvm();
-  cur.tsVersion = "1.104.1";
-  const a = await runTs(cur, { action: "update", apply: true });
+  cur.tsVersion = NEW;
+  const a = runTs(cur, APPLY);
   await a.p;
   assertEquals(a.written()[0].outcome, "current");
   assertEquals(deviceWrites(cur).length, 0);
 
   const down = new FakeJetKvm();
-  const b = await runTs(down, {
-    action: "update",
-    version: "1.90.0",
-    apply: true,
-  });
+  const b = runTs(down, { ...APPLY, version: "1.90.0" });
   await assertRejects(() => b.p, Error, "older than");
   assertEquals(deviceWrites(down).length, 0);
 });
 
-Deno.test("tailscale update refuses without the vendor boot script or an install", async () => {
-  const noBoot = new FakeJetKvm({ probeOver: { ts_boot: "0" } });
-  const a = await runTs(noBoot, { action: "update", apply: true });
-  await assertRejects(() => a.p, Error, "S22tailscale");
-  const none = new FakeJetKvm({ probeOver: { ts_installed: "0" } });
-  const b = await runTs(none, { action: "update", apply: true });
-  await assertRejects(() => b.p, Error, "not installed");
-  assertEquals(deviceWrites(noBoot).length + deviceWrites(none).length, 0);
+Deno.test("tailscale update refuses without the boot script, an install, or a readable free-space figure", async () => {
+  for (
+    const [over, msg] of [
+      [{ ts_boot: "0" }, "S22tailscale"],
+      [{ ts_installed: "0" }, "not installed"],
+      [{ disk: "" }, "could not read free space"],
+    ] as const
+  ) {
+    const fake = new FakeJetKvm({ probeOver: over });
+    const r = runTs(fake, APPLY);
+    await assertRejects(() => r.p, Error, msg);
+    assertEquals(deviceWrites(fake).length, 0, msg);
+    assert(!fake.fetchLog.some((u) => u.endsWith(".tgz")), msg);
+  }
 });
 
 Deno.test("version argument rejects anything that is not x.y.z", () => {
@@ -609,16 +841,14 @@ Deno.test("version argument rejects anything that is not x.y.z", () => {
   );
 });
 
-Deno.test("rebootAfter: reboots once after a verified update and requires a fresh boot that rejoins", async () => {
+// ---------------------------------------------------------------------------
+// rebootAfter
+// ---------------------------------------------------------------------------
+
+Deno.test("rebootAfter: reboots once after a verified update and requires a new boot id that rejoins", async () => {
   const fake = new FakeJetKvm();
-  const { p, written } = runTs(fake, {
-    action: "update",
-    apply: true,
-    rebootAfter: true,
-  });
-  await p;
-  const [w] = written();
-  model.resources.tailscale.schema.parse(w);
+  const { w, error } = await applied(fake, { rebootAfter: true });
+  assertEquals(error, null);
   assertEquals(w.outcome, "done");
   assertStringIncludes(w.message, "Rebooted");
   assertEquals(w.steps.length, 6);
@@ -638,58 +868,47 @@ Deno.test("rebootAfter is not sent without apply, nor when the update did not re
   assertEquals(deviceWrites(dry).length, 0);
 
   const stuck = new FakeJetKvm();
-  stuck.swapOutcome = "stuck";
-  const b = runTs(stuck, {
-    action: "update",
-    apply: true,
+  stuck.swapPlan = "stuck";
+  await applied(stuck, { rebootAfter: true });
+  assert(!sent(stuck, "reboot"));
+});
+
+Deno.test("rebootAfter does not reboot when the boot id cannot be read first", async () => {
+  const fake = new FakeJetKvm({ probeOver: { boot_id: "" } });
+  const { w, error } = await applied(fake, { rebootAfter: true });
+  assertStringIncludes(String(error), "was not rebooted");
+  assertEquals(w.outcome, "reboot-unverified");
+  assert(!sent(fake, "reboot"));
+});
+
+Deno.test("rebootAfter reports a failed reboot command at once, with its error", async () => {
+  const fake = new FakeJetKvm();
+  fake.rebootCode = 1;
+  const { w, error } = await applied(fake, {
     rebootAfter: true,
-    rejoinTimeoutMs: 30,
+    rebootTimeoutMs: 100000,
   });
-  await assertRejects(() => b.p, Error, "rolled back");
-  assert(!deviceWrites(stuck).some((l) => l.command.includes("reboot")));
+  assertStringIncludes(String(error), "reboot command failed");
+  assertEquals(w.outcome, "reboot-unverified");
+  assertStringIncludes(w.message, "not permitted");
 });
 
 for (
   const [outcome, msg] of [
     ["dead", "did not answer SSH"],
     ["noboot", "after the reboot Tailscale"],
-    ["ignored", "never showed a reboot"],
+    ["ignored", "boot id unchanged"],
   ] as const
 ) {
   Deno.test(`rebootAfter fails loudly, never green, when the reboot is ${outcome}`, async () => {
     const fake = new FakeJetKvm();
     fake.rebootOutcome = outcome;
-    const { p, written } = runTs(fake, {
-      action: "update",
-      apply: true,
+    const { w, error } = await applied(fake, {
       rebootAfter: true,
       rebootTimeoutMs: 30,
     });
-    await assertRejects(() => p, Error, msg);
-    const [w] = written();
-    model.resources.tailscale.schema.parse(w);
+    assertStringIncludes(String(error), msg);
     assertEquals(w.outcome, "reboot-unverified");
-    assertStringIncludes(w.message, "backup-1.98.8");
+    assertStringIncludes(w.message, `backup-${OLD}`);
   });
 }
-
-Deno.test("tailscale update reports a swap that never took effect as unchanged, without a pointless rollback", async () => {
-  const fake = new FakeJetKvm();
-  // the launch runs, but the device never changes (e.g. the script died before swapping)
-  fake.script = "";
-  const origSsh = fake.ssh.bind(fake);
-  fake.ssh = (command: string, stdin?: Uint8Array) =>
-    command.includes("nohup")
-      ? Promise.resolve({ code: 0, stdout: "", stderr: "" })
-      : origSsh(command, stdin);
-  const { p, written } = runTs(fake, {
-    action: "update",
-    apply: true,
-    rejoinTimeoutMs: 30,
-  });
-  await assertRejects(() => p, Error, "device unchanged");
-  const [w] = written();
-  assertEquals(w.outcome, "rolled-back");
-  assertStringIncludes(w.message, "did not take effect");
-  assert(!deviceWrites(fake).some((l) => l.stdin.includes("ROLLBACK_DONE")));
-});

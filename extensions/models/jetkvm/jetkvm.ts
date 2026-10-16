@@ -184,8 +184,6 @@ async function run(
 
 /** Default transport: `curl` for the device, `ssh` for commands, fetch for the internet. */
 export class CliTransport implements Transport {
-  private knownHosts: string | null = null;
-
   constructor(private readonly g: GlobalArgs) {}
 
   async device(path: string): Promise<HttpResult> {
@@ -229,25 +227,35 @@ export class CliTransport implements Transport {
     stdin: Uint8Array = new Uint8Array(),
     timeoutMs = this.g.timeoutMs,
   ): Promise<SshResult> {
-    if (this.g.hostKey && !this.knownHosts) {
-      this.knownHosts = await Deno.makeTempFile({ prefix: "jetkvm-kh-" });
-      await Deno.writeTextFile(this.knownHosts, `jetkvm ${this.g.hostKey}\n`);
+    // A per-call known_hosts file, removed afterwards: it holds only the
+    // public host key, but nothing should be left in the temp dir.
+    let knownHosts: string | null = null;
+    if (this.g.hostKey) {
+      knownHosts = await Deno.makeTempFile({ prefix: "jetkvm-kh-" });
+      await Deno.writeTextFile(knownHosts, `jetkvm ${this.g.hostKey}\n`);
     }
-    const res = await run(
-      "ssh",
-      sshArgs(this.g, this.knownHosts, command),
-      stdin,
-      timeoutMs,
-    );
-    return {
-      code: res.code,
-      stdout: new TextDecoder().decode(res.stdout),
-      stderr: res.stderr,
-    };
+    try {
+      const res = await run(
+        "ssh",
+        sshArgs(this.g, knownHosts, command),
+        stdin,
+        timeoutMs,
+      );
+      return {
+        code: res.code,
+        stdout: new TextDecoder().decode(res.stdout),
+        stderr: res.stderr,
+      };
+    } finally {
+      if (knownHosts) await Deno.remove(knownHosts).catch(() => {});
+    }
   }
 
   async fetch(url: string, timeoutMs = this.g.timeoutMs): Promise<HttpResult> {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+      .catch((e) => {
+        throw new Error(`GET ${url} failed: ${(e as Error).message}`);
+      });
     return {
       status: res.status,
       body: new Uint8Array(await res.arrayBuffer()),
@@ -308,6 +316,7 @@ for f in /sys/class/udc/*/state; do [ -r "$f" ] && echo "usb=$(cat "$f")"; done
 echo "devmode=$([ -e /userdata/jetkvm/devmode.enable ] && echo 1 || echo 0)"
 echo "uptime=$(cut -d' ' -f1 /proc/uptime)"
 echo "now=$(date -u +%s)"
+echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 df -k /userdata 2>/dev/null | tail -1 | awk '{print "disk="$(NF-4)","$(NF-2)}'
 echo "video=$(ps 2>/dev/null | grep -o 'native+video{[a-z]*}' | head -1)"
 ts=${TS_DIR}/tailscale
@@ -319,7 +328,7 @@ if [ -x "$ts" ]; then
   st=$("$ts" status --json --peers=false 2>/dev/null)
   echo "ts_backend=$(echo "$st" | grep -m1 '"BackendState"' | sed 's/.*: *"\\([^"]*\\)".*/\\1/')"
   echo "ts_online=$(echo "$st" | grep -m1 '"Online"' | sed 's/.*: *\\([a-z]*\\).*/\\1/')"
-  echo "ts_ip=$(echo "$st" | grep -o '"100\\.[0-9.]*"' | head -1 | tr -d '"')"
+  echo "ts_ip=$(echo "$st" | sed -n '/"TailscaleIPs"/,/]/p' | grep -o '"[0-9][0-9.]*"' | head -1 | tr -d '"')"
   echo "ts_dns=$(echo "$st" | grep -m1 '"DNSName"' | sed 's/.*: *"\\([^"]*\\)".*/\\1/')"
 else
   echo "ts_installed=0"
@@ -335,6 +344,8 @@ export interface Probe {
   devMode: boolean;
   uptimeSeconds: number | null;
   deviceTime: number | null;
+  /** Kernel boot id: changes on every boot, unlike uptime it cannot be misread. */
+  bootId: string | null;
   diskTotalKb: number | null;
   diskFreeKb: number | null;
   videoPipeline: string | null;
@@ -377,6 +388,7 @@ export function parseProbe(stdout: string): Probe {
     devMode: kv.get("devmode") === "1",
     uptimeSeconds: n("uptime"),
     deviceTime: n("now"),
+    bootId: s("boot_id"),
     diskTotalKb: Number.isFinite(total) && total > 0 ? total : null,
     diskFreeKb: Number.isFinite(free) && total > 0 ? free : null,
     videoPipeline: video,
@@ -616,9 +628,14 @@ const TailscaleSchema = z.object({
     "dry-run",
     "done",
     "refused",
+    "unchanged",
     "rolled-back",
+    "rollback-failed",
+    "swap-unconfirmed",
     "reboot-unverified",
-  ]),
+  ]).describe(
+    "unchanged: the swap never took effect. rollback-failed and swap-unconfirmed need a human: the device may be on either version, or have tailscaled down.",
+  ),
   message: z.string(),
   fromVersion: z.string().nullable(),
   targetVersion: z.string().nullable(),
@@ -684,9 +701,17 @@ export async function latestFirmware(
   };
 }
 
+/** Files the detached swap leaves on the device. The log is kept for diagnosis. */
+export const SWAP_SH = "/userdata/tailscale-update.sh";
+export const SWAP_LOG = "/userdata/tailscale-update.log";
+export const SWAP_PID = "/userdata/tailscale-update.pid";
+export const SWAP_STATUS = "/userdata/tailscale-update.status";
+
 /**
  * The on-device swap, run detached so that it finishes even if the SSH
- * session that started it drops. Pure and exported for tests.
+ * session that started it drops. It records its PID, and on any exit its
+ * status, removes its staging files, and makes sure tailscaled is running, so
+ * a failure part-way never leaves the daemon down. Pure and exported for tests.
  */
 export function swapScript(version: string, fromVersion: string): string {
   if (!TS_VERSION.test(version) || !TS_VERSION.test(fromVersion)) {
@@ -695,19 +720,32 @@ export function swapScript(version: string, fromVersion: string): string {
     );
   }
   const stage = `/userdata/tailscale-stage-${version}`;
+  const tgz = `/userdata/tailscale-${version}.tgz`;
   const backup = `${TS_DIR}/backup-${fromVersion}`;
-  return `set -e
-log() { echo "$(date -u +%H:%M:%S) $*"; }
+  return `log() { echo "$(date -u +%H:%M:%S) $*"; }
+echo $$ > ${SWAP_PID}
+finish() {
+  rc=$?
+  rm -rf ${stage} ${tgz} ${TS_DIR}/tailscale.new ${TS_DIR}/tailscaled.new ${backup}.tmp
+  pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start
+  log "exit $rc"
+  echo "$rc" > ${SWAP_STATUS}
+}
+trap finish EXIT
+set -e
 cd /userdata
 rm -rf ${stage}
 mkdir -p ${stage}
-tar xzf /userdata/tailscale-${version}.tgz -C ${stage}
+tar xzf ${tgz} -C ${stage}
 src=${stage}/tailscale_${version}_arm
 [ -x "$src/tailscale" ] && [ -x "$src/tailscaled" ] || { log "tarball lacks binaries"; exit 3; }
 if [ ! -d ${backup} ]; then
-  mkdir -p ${backup}
-  cp -p ${TS_DIR}/tailscale ${TS_DIR}/tailscaled ${backup}/
+  rm -rf ${backup}.tmp
+  mkdir -p ${backup}.tmp
+  cp -p ${TS_DIR}/tailscale ${TS_DIR}/tailscaled ${backup}.tmp/
+  mv ${backup}.tmp ${backup}
 fi
+[ -x ${backup}/tailscale ] && [ -x ${backup}/tailscaled ] || { log "backup in ${backup} is incomplete"; exit 4; }
 log "backup ready in ${backup}"
 cp "$src/tailscale" ${TS_DIR}/tailscale.new
 cp "$src/tailscaled" ${TS_DIR}/tailscaled.new
@@ -719,12 +757,14 @@ log "binaries swapped"
 ${TS_DIR}/tailscale configure jetkvm || log "configure jetkvm failed (non-fatal)"
 ${TS_BOOT} start
 log "tailscaled started"
-rm -rf ${stage} /userdata/tailscale-${version}.tgz
 log "SWAP_DONE"
 `;
 }
 
-/** Restore the backed-up binaries and restart. Pure and exported for tests. */
+/**
+ * Restore the backed-up binaries and restart. Checks the backup before
+ * stopping anything, and starts tailscaled on any exit. Pure and exported.
+ */
 export function rollbackScript(fromVersion: string): string {
   if (!TS_VERSION.test(fromVersion)) {
     throw new Error(
@@ -732,8 +772,9 @@ export function rollbackScript(fromVersion: string): string {
     );
   }
   const backup = `${TS_DIR}/backup-${fromVersion}`;
-  return `set -e
-[ -x ${backup}/tailscaled ] || { echo "no backup at ${backup}"; exit 3; }
+  return `[ -x ${backup}/tailscale ] && [ -x ${backup}/tailscaled ] || { echo "no complete backup at ${backup}"; exit 3; }
+trap 'pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start' EXIT
+set -e
 ${TS_BOOT} stop || true
 i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
 cp -p ${backup}/tailscale ${backup}/tailscaled ${TS_DIR}/
@@ -742,9 +783,45 @@ echo ROLLBACK_DONE
 `;
 }
 
-/** Where the detached swap script and its log live on the device. */
-export const SWAP_SH = "/userdata/tailscale-update.sh";
-export const SWAP_LOG = "/userdata/tailscale-update.log";
+/** Report the detached swap's state and log. Read-only. */
+export const SWAP_STATE_SCRIPT =
+  `if [ -f ${SWAP_STATUS} ]; then echo "state=exited $(cat ${SWAP_STATUS})"
+elif [ -f ${SWAP_PID} ] && kill -0 "$(cat ${SWAP_PID})" 2>/dev/null; then echo "state=running"
+elif [ -f ${SWAP_PID} ]; then echo "state=vanished"
+else echo "state=none"; fi
+echo "---"
+cat ${SWAP_LOG} 2>/dev/null
+echo "${PROBE_END}"
+`;
+
+/** What the detached swap is doing. `unknown` when the device could not say. */
+export interface SwapState {
+  state: "running" | "exited" | "vanished" | "none" | "unknown";
+  exitCode: number | null;
+  log: string;
+}
+
+/** Parse SWAP_STATE_SCRIPT output. Pure and exported for tests. */
+export function parseSwapState(stdout: string | null): SwapState {
+  if (!stdout || !stdout.includes(PROBE_END)) {
+    return { state: "unknown", exitCode: null, log: "" };
+  }
+  const [head, ...rest] = stdout.split("\n---\n");
+  const log = rest.join("\n---\n").replace(PROBE_END, "").trim();
+  const m = head.match(/state=(running|exited|vanished|none)(?: (\d+))?/);
+  if (!m) return { state: "unknown", exitCode: null, log };
+  return {
+    state: m[1] as SwapState["state"],
+    exitCode: m[2] === undefined ? null : Number(m[2]),
+    log,
+  };
+}
+
+async function swapState(t: Transport): Promise<SwapState> {
+  const r = await t.ssh("sh -s", new TextEncoder().encode(SWAP_STATE_SCRIPT))
+    .catch(() => null);
+  return parseSwapState(r && r.code === 0 ? r.stdout : null);
+}
 
 /** Polling cadence for the rejoin check. Exported so tests can shorten it. */
 export const rejoinPoll = { intervalMs: 3000 };
@@ -815,6 +892,7 @@ export const model = {
         const g = context.globalArgs;
         const t = transportFactory.create(g);
         const checkedAt = new Date();
+        context.logger.info("JetKVM {host}: health check", { host: g.host });
         const blank = {
           host: g.host,
           checkedAt: checkedAt.toISOString(),
@@ -1079,9 +1157,14 @@ export const model = {
         }
         // Tarball (~30 MB) + staged copy (~65 MB) + backup (~65 MB).
         const needKb = 200 * 1024;
-        if (before.diskFreeKb !== null && before.diskFreeKb < needKb) {
+        if (before.diskFreeKb === null) {
           await refuse(
-            `/userdata has ${Math.round(before.diskFreeKb / 1024)} MB free; ${
+            "could not read free space on /userdata, so the update cannot check it fits",
+          );
+        }
+        if (before.diskFreeKb! < needKb) {
+          await refuse(
+            `/userdata has ${Math.round(before.diskFreeKb! / 1024)} MB free; ${
               needKb / 1024
             } MB needed`,
           );
@@ -1136,19 +1219,22 @@ export const model = {
         }
 
         // 2. Upload and re-verify on the device.
-        context.logger.warn("Tailscale update on {host}: {from} → {to}", {
+        context.logger.info("Tailscale update on {host}: {from} → {to}", {
           host: g.host,
           from: ts.version,
           to: target,
         });
         const remoteTgz = `/userdata/tailscale-${target}.tgz`;
+        const cleanUp = () =>
+          t.ssh(`rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS}`)
+            .catch(() => null);
         const up = await t.ssh(
           `cat > ${remoteTgz} && sha256sum ${remoteTgz}`,
           tgz.body,
           args.transferTimeoutMs,
         );
         if (up.code !== 0 || up.stdout.trim().split(/\s+/)[0] !== got) {
-          await t.ssh(`rm -f ${remoteTgz}`);
+          await cleanUp();
           await refuse(
             `upload did not verify on the device (exit ${up.code}): ${up.stderr.trim()}`,
           );
@@ -1163,10 +1249,11 @@ export const model = {
           swapScript(target!, ts.version!),
         );
         const wrote = await t.ssh(
-          `cat > ${SWAP_SH} && wc -c < ${SWAP_SH}`,
+          `rm -f ${SWAP_PID} ${SWAP_STATUS} ${SWAP_LOG} && cat > ${SWAP_SH} && wc -c < ${SWAP_SH}`,
           script,
         );
         if (wrote.code !== 0 || Number(wrote.stdout.trim()) !== script.length) {
+          await cleanUp();
           await refuse(
             `the swap script did not land on the device (exit ${wrote.code}, ${
               wrote.stdout.trim() || 0
@@ -1175,32 +1262,55 @@ export const model = {
         }
         const swap = await t.ssh(
           `nohup sh ${SWAP_SH} > ${SWAP_LOG} 2>&1 < /dev/null &`,
-        );
+        ).catch((e) => ({
+          code: -1,
+          stdout: "",
+          stderr: (e as Error).message,
+        }));
         if (swap.code !== 0) {
-          await refuse(
-            `could not start the swap (exit ${swap.code}): ${swap.stderr.trim()}`,
+          // The session can drop after the job started; only a device that
+          // shows no trace of the script counts as "never started".
+          const st = await swapState(t);
+          if (st.state === "none") {
+            await cleanUp();
+            await refuse(
+              `could not start the swap (exit ${swap.code}): ${swap.stderr.trim()}`,
+            );
+          }
+          context.logger.warn(
+            "swap launch on {host} returned exit {code}, but the device shows it {state}; watching it",
+            { host: g.host, code: swap.code, state: st.state },
           );
         }
 
-        // 4. Wait for the node to come back as the same machine.
+        // 4. Wait for the node to come back as the same machine. Past the
+        // deadline, keep waiting while the script is still running (a slow tar
+        // on armv7), up to twice the timeout: deciding while it runs would
+        // race it.
         const rejoined = (p: Probe["tailscale"]) =>
           p.version === target && p.daemonRunning &&
           p.backendState === "Running" && p.online === true &&
           (ts.ip === null || p.ip === ts.ip);
         let after: Probe["tailscale"] | null = null;
-        const deadline = Date.now() + args.rejoinTimeoutMs;
-        while (Date.now() < deadline) {
+        let st: SwapState = { state: "unknown", exitCode: null, log: "" };
+        const started = Date.now();
+        while (true) {
           await sleep(rejoinPoll.intervalMs);
           after = await probe(t).then((p) => p.tailscale).catch(() => after);
           if (after && rejoined(after)) break;
+          const elapsed = Date.now() - started;
+          if (elapsed < args.rejoinTimeoutMs) continue;
+          st = await swapState(t);
+          if (st.state !== "running" || elapsed >= 2 * args.rejoinTimeoutMs) {
+            break;
+          }
         }
-        const log = (await t.ssh(`cat ${SWAP_LOG}`).catch(
-          () => null,
-        ))?.stdout.trim() ?? "";
+
         if (after && rejoined(after)) {
           const done =
             `updated ${ts.version} → ${target}; Running, online, ${after.ip}. Backup kept in ${TS_DIR}/backup-${ts.version}/`;
           if (!args.rebootAfter) {
+            context.logger.info("{host}: {msg}", { host: g.host, msg: done });
             const h = await record({
               applied: true,
               outcome: "done",
@@ -1212,16 +1322,40 @@ export const model = {
           }
 
           // 4b. Prove it also starts from the boot script. A reboot is seen as
-          // uptime going down; any probe before that is the old boot.
+          // a new kernel boot id; without one to compare, do not reboot.
+          const unverified = async (why: string, last: Probe | null) => {
+            await record({
+              applied: true,
+              outcome: "reboot-unverified",
+              message:
+                `${done}. But ${why}. Restore by hand from ${TS_DIR}/backup-${ts.version}/ if needed`,
+              after: last?.tailscale ?? after,
+              sha256: got,
+            });
+            throw new Error(
+              `Tailscale on ${g.host}: update applied, but ${why}`,
+            );
+          };
           const pre = await probe(t).catch(() => null);
-          const upBefore = pre?.uptimeSeconds ?? Infinity;
-          context.logger.warn(
+          if (!pre?.bootId) {
+            await unverified(
+              "the boot id could not be read before rebooting, so the KVM was not rebooted",
+              pre,
+            );
+          }
+          context.logger.info(
             "rebooting {host} to verify Tailscale starts at boot",
-            {
-              host: g.host,
-            },
+            { host: g.host },
           );
-          await t.ssh("(sleep 1; reboot) >/dev/null 2>&1 &").catch(() => null);
+          const rb = await t.ssh("(sleep 1; reboot) >/dev/null 2>&1 &").catch((
+            e,
+          ) => ({ code: -1, stdout: "", stderr: (e as Error).message }));
+          if (rb.code !== 0) {
+            await unverified(
+              `the reboot command failed (exit ${rb.code}): ${rb.stderr.trim()}`,
+              pre,
+            );
+          }
           let booted: Probe | null = null;
           let sawReboot = false;
           const bootDeadline = Date.now() + args.rebootTimeoutMs;
@@ -1229,93 +1363,119 @@ export const model = {
             await sleep(rejoinPoll.intervalMs);
             const p = await probe(t).catch(() => null);
             if (!p) continue;
-            if (p.uptimeSeconds !== null && p.uptimeSeconds < upBefore) {
-              sawReboot = true;
-            }
             booted = p;
+            sawReboot = p.bootId !== null && p.bootId !== pre!.bootId;
             if (sawReboot && rejoined(p.tailscale)) break;
           }
           if (booted && sawReboot && rejoined(booted.tailscale)) {
+            const msg =
+              `${done}. Rebooted: back after boot with ${booted.tailscale.version}, Running, online, ${booted.tailscale.ip} (uptime ${booted.uptimeSeconds}s)`;
+            context.logger.info("{host}: {msg}", { host: g.host, msg });
             const h = await record({
               applied: true,
               outcome: "done",
-              message:
-                `${done}. Rebooted: back after boot with ${booted.tailscale.version}, Running, online, ${booted.tailscale.ip} (uptime ${booted.uptimeSeconds}s)`,
+              message: msg,
               after: booted.tailscale,
               sha256: got,
             });
             return { dataHandles: [h] };
           }
-          const why = !booted
-            ? "the KVM did not answer SSH after the reboot"
-            : !sawReboot
-            ? "the KVM never showed a reboot (uptime did not reset)"
-            : `after the reboot Tailscale is ${booted.tailscale.version}, ${booted.tailscale.backendState}, online=${booted.tailscale.online}, ip=${booted.tailscale.ip}`;
-          await record({
-            applied: true,
-            outcome: "reboot-unverified",
-            message: `${done}. But ${why} within ${
-              args.rebootTimeoutMs / 1000
-            }s. Restore by hand from ${TS_DIR}/backup-${ts.version}/ if needed`,
-            after: booted?.tailscale ?? null,
-            sha256: got,
-          });
-          throw new Error(`Tailscale on ${g.host}: update applied, but ${why}`);
+          await unverified(
+            (!booted
+              ? "the KVM did not answer SSH after the reboot"
+              : !sawReboot
+              ? "the KVM never showed a reboot (boot id unchanged)"
+              : `after the reboot Tailscale is ${booted.tailscale.version}, ${booted.tailscale.backendState}, online=${booted.tailscale.online}, ip=${booted.tailscale.ip}`) +
+              ` within ${args.rebootTimeoutMs / 1000}s`,
+            booted,
+          );
         }
 
-        // 5a. Still on the old binaries and no "binaries swapped" in the log:
-        // the swap never took effect, so there is nothing to roll back.
-        if (
-          after?.version === ts.version && !log.includes("binaries swapped")
-        ) {
+        const last = after
+          ? `${after.version}, ${after.backendState}, online=${after.online}, ip=${after.ip}`
+          : "no probe";
+        const logText = st.log || "(empty)";
+
+        // 5a. The script is still running, or the device cannot say: rolling
+        // back now would race it. Leave it to a human, with what is known.
+        if (st.state === "running" || st.state === "unknown") {
           await record({
             applied: true,
-            outcome: "rolled-back",
-            message: `the swap did not take effect within ${
-              args.rejoinTimeoutMs / 1000
-            }s: the device is unchanged on ${ts.version} (${after?.backendState}, online=${after?.online}). Swap log: ${
-              log || "(empty)"
-            }`,
+            outcome: "swap-unconfirmed",
+            message: `the swap is ${st.state} after ${
+              2 * args.rejoinTimeoutMs / 1000
+            }s (last: ${last}); not rolling back while it may still act. Check ${SWAP_LOG} and ${SWAP_STATUS}; backup in ${TS_DIR}/backup-${ts.version}/`,
             after,
             sha256: got,
           });
           throw new Error(
-            `Tailscale update on ${g.host} did not take effect; device unchanged. Swap log:\n${
-              log || "(empty)"
-            }`,
+            `Tailscale update on ${g.host} is unconfirmed (swap ${st.state}); swap log:\n${logText}`,
           );
         }
 
-        // 5b. It was swapped and did not come back: restore the old binaries.
+        // 5b. The script finished without swapping: the device is unchanged.
+        if (!st.log.includes("binaries swapped")) {
+          await record({
+            applied: false,
+            outcome: "unchanged",
+            message: `the swap exited (${st.state}${
+              st.exitCode === null ? "" : ` ${st.exitCode}`
+            }) before swapping; the device is unchanged on ${ts.version} (${last}). Swap log: ${logText}`,
+            after,
+            sha256: got,
+          });
+          throw new Error(
+            `Tailscale update on ${g.host} did not take effect; device unchanged. Swap log:\n${logText}`,
+          );
+        }
+
+        // 5c. It was swapped and did not come back: restore the old binaries.
         context.logger.warn(
           "Tailscale on {host} did not rejoin as {to}; rolling back. Swap log: {log}",
-          { host: g.host, to: target, log },
+          { host: g.host, to: target, log: logText },
         );
-        const rb = await t.ssh(
+        const rbk = await t.ssh(
           "sh -s",
           new TextEncoder().encode(rollbackScript(ts.version!)),
-        );
-        await sleep(rejoinPoll.intervalMs);
-        const restored = await probe(t).then((p) => p.tailscale).catch(() =>
-          null
-        );
+        ).catch((e) => ({
+          code: -1,
+          stdout: "",
+          stderr: (e as Error).message,
+        }));
+        let restored: Probe["tailscale"] | null = null;
+        const rbDeadline = Date.now() + args.rejoinTimeoutMs;
+        while (Date.now() < rbDeadline) {
+          await sleep(rejoinPoll.intervalMs);
+          restored = await probe(t).then((p) => p.tailscale).catch(() => null);
+          if (
+            restored?.version === ts.version && restored.daemonRunning &&
+            restored.backendState === "Running"
+          ) break;
+        }
+        const ok = rbk.code === 0 && restored?.version === ts.version &&
+          restored.daemonRunning && restored.backendState === "Running";
         await record({
           applied: true,
-          outcome: "rolled-back",
-          message: `${target} did not rejoin within ${
-            args.rejoinTimeoutMs / 1000
-          }s (last: ${
-            after
-              ? `${after.version}, ${after.backendState}, online=${after.online}, ip=${after.ip}`
-              : "no probe"
-          }); rollback exit ${rb.code}, now ${restored?.version ?? "unknown"} ${
-            restored?.backendState ?? ""
-          }`,
+          outcome: ok ? "rolled-back" : "rollback-failed",
+          message:
+            `${target} did not rejoin (last: ${last}); rollback exit ${rbk.code}${
+              rbk.code === 0
+                ? ""
+                : ` (${rbk.stderr.trim() || rbk.stdout.trim()})`
+            }, now ${restored?.version ?? "unknown"} ${
+              restored?.backendState ?? ""
+            }${
+              ok
+                ? ""
+                : `. NEEDS A HUMAN: restore from ${TS_DIR}/backup-${ts.version}/`
+            }`,
           after: restored,
           sha256: got,
         });
         throw new Error(
-          `Tailscale update on ${g.host} rolled back; swap log:\n${log}`,
+          `Tailscale update on ${g.host} ${
+            ok ? "rolled back" : "failed AND its rollback failed"
+          }; swap log:\n${logText}`,
         );
       },
     },
