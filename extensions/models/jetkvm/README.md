@@ -98,6 +98,24 @@ With `apply: true` it:
 5. If that does not happen within `rejoinTimeoutMs` (default 120 s), restores
    the backup, restarts the daemon, records `rolled-back` and fails.
 
+The `outcome` says what happened, and which ones need a human:
+
+| `outcome`           | Meaning                                                                   |
+| ------------------- | ------------------------------------------------------------------------- |
+| `done`              | Updated and rejoined (and, with `rebootAfter`, rejoined after a reboot)   |
+| `unchanged`         | The swap exited before swapping; the device is as it was                  |
+| `rolled-back`       | Swapped, did not rejoin, old binaries restored and running                |
+| `rollback-failed`   | **Needs a human**: the restore did not bring the old version back up      |
+| `swap-unconfirmed`  | **Needs a human**: the swap was still running or unreadable at 2x timeout |
+| `reboot-unverified` | Updated, but the reboot check did not pass; the backup is still there     |
+
+The swap script records its PID and exit status, and on any exit it removes
+its staging files and starts tailscaled if it is not running, so a failure
+part-way never leaves the daemon down. The reboot check compares the kernel
+boot ID, and is skipped (`reboot-unverified`, no reboot) if it cannot be read
+first. The "same tailnet IP" check applies when the probe can read an IPv4
+tailnet address.
+
 Use the device's **LAN address** as `host`. The update restarts tailscaled, so
 an SSH session running over the tailnet would be cut.
 
