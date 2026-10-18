@@ -51,7 +51,7 @@ with a sentinel line, and output without it fails.
 
 | Finding                         | Severity           | Meaning                                                     |
 | ------------------------------- | ------------------ | ----------------------------------------------------------- |
-| `unreachable`, `ssh_failed`     | fail               | No web UI, or SSH refused (dev mode off, key, host key)     |
+| `ssh_failed`                    | fail               | SSH refused (dev mode off, key, host key); with `unreachable` too when `/metrics` is also down |
 | `web_unreachable`               | warn               | SSH works but `/metrics` did not answer                     |
 | `app_update_available`          | warn               | JetKVM's release API offers a newer app                     |
 | `system_update_available`       | warn               | ...or a newer system image                                  |
@@ -62,7 +62,8 @@ with a sentinel line, and output without it fails.
 | `tailscale_offline`             | warn               | Running, but the coordination server sees it offline        |
 | `tailscale_update_available`    | warn               | pkgs.tailscale.com has a newer stable                       |
 | `tailscale_boot_script_missing` | warn               | No `S22tailscale`: Tailscale will not start after a reboot  |
-| `tailscale_unreachable`         | warn               | With `tailnetIp`: `/metrics` did not answer on that address |
+| `tailscale_unreachable`         | warn               | With `tailnetIp`: nothing answered on that address          |
+| `tailscale_wrong_device`        | warn               | With `tailnetIp`: something other than this JetKVM answered |
 | `tailscale_ip_changed`          | warn               | With `tailnetIp`: the device reports a different tailnet IP |
 | `tailscale_not_installed`       | info               |                                                             |
 | `developer_mode_enabled`        | info (warn strict) | Root SSH is open to the installed key                       |
@@ -77,11 +78,17 @@ cloud token.
 **The tailnet path.** A node deleted from the tailnet does not log the device
 out: tailscaled keeps reporting `Running` with a stale peer list, so
 `tailscale_down` stays quiet until the daemon restarts. Set the `tailnetIp`
-global argument to have `health` also fetch `/metrics` on that address, which
-proves the path from the tailnet node swamp runs behind. The request is
-unauthenticated, so a stale address that now belongs to another node learns
-nothing. A re-added node gets a new address; `tailscale_ip_changed` names both,
-and the fix is updating `tailnetIp`.
+global argument to have `health` also probe that address from the tailnet node
+swamp runs behind. The probe runs before the SSH probe and is recorded even when
+SSH on the LAN fails, which is what tells a dead device from a broken LAN.
+
+It is anonymous, so a stale address that now belongs to another node learns
+nothing: `/metrics` needs no login, and the identity check is an `ssh-keyscan`
+that offers no key. It proves the answer came from this JetKVM: the page must
+carry `jetkvm_build_info`, and with `hostKey` pinned the key on the tailnet
+address must match it. `tailscale_unreachable` means nothing answered,
+`tailscale_wrong_device` means something else did. A re-added node gets a new
+address; `tailscale_ip_changed` names both, and the fix is updating `tailnetIp`.
 
 ### `tailscale`
 
@@ -107,7 +114,11 @@ With `apply: true` it:
    **same tailnet IP**, which proves it is the same machine with its state
    intact.
 5. If that does not happen within `rejoinTimeoutMs` (default 120 s), restores
-   the backup, restarts the daemon, records `rolled-back` and fails.
+   the backup, restarts the daemon, records `rolled-back` and fails. The
+   restore ignores a dropped session and renames the binaries into place, so a
+   daemon slow to stop cannot leave it half-done.
+6. After a verified update, removes every backup except the one it just made
+   (each is about 65 MB), so the version it replaced stays restorable.
 
 The `outcome` says what happened, and which ones need a human:
 
@@ -152,12 +163,14 @@ globalArguments:
   # tailnetIp: 198.51.100.7           # optional: probe the Tailscale path too
 ```
 
-Requirements on the machine running swamp: `ssh` and `curl` on `PATH`, and
+Requirements on the machine running swamp: `ssh`, `ssh-keyscan` and `curl` on `PATH`, and
 outbound HTTPS to pkgs.tailscale.com and api.jetkvm.com for the update checks.
 
 ## Scheduling
 
 `health` is cheap: one HTTP GET, one SSH session, and two small HTTPS requests.
+With `tailnetIp` set, add one HTTP GET and one `ssh-keyscan` on that address,
+each capped at 10 s.
 Hourly is reasonable. Alert on `verdict != "ok"` and on the age of the latest
 `health` record, so a check that stops running is noticed too.
 

@@ -18,12 +18,15 @@ import {
   type Probe,
   PROBE_END,
   PROBE_SCRIPT,
+  pruneBackupsScript,
   rejoinPoll,
+  ROLLBACK_LOG,
   rollbackScript,
   sshArgs,
   type SshResult,
   SWAP_STATE_SCRIPT,
   swapScript,
+  tailnetFindings,
   type Transport,
   transportFactory,
 } from "./jetkvm.ts";
@@ -225,7 +228,7 @@ Deno.test("swap and rollback scripts refuse non-version input and keep the vendo
   assertRejectsSync(() => rollbackScript("$(id)"));
   assertStringIncludes(
     rollbackScript("1.98.8"),
-    "cp -p /userdata/tailscale/backup-1.98.8/tailscale",
+    "cp -p /userdata/tailscale/backup-1.98.8/$b /userdata/tailscale/$b.rb",
   );
 });
 
@@ -264,6 +267,7 @@ Deno.test("every generated script parses as sh", async () => {
       ["swap", swapScript("1.104.1", "1.98.8")],
       ["rollback", rollbackScript("1.98.8")],
       ["swap state", SWAP_STATE_SCRIPT],
+      ["prune", pruneBackupsScript("1.98.8")],
     ]
   ) assertEquals(await shSyntax(script), "", `${name} script: syntax error`);
 });
@@ -335,8 +339,10 @@ class FakeJetKvm implements Transport {
   uptime = 5000;
   bootId = "boot-1";
   /** ok: swaps and rejoins. stuck: swaps, never online. slow: running for `slowProbes` probes, then ok. hang: running forever. noop: exits 3 before swapping. */
-  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" = "ok";
+  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" | "starting" = "ok";
   slowProbes = 0;
+  /** With swapPlan "starting": state checks before the swap finishes. */
+  startingChecks = Infinity;
   launchCode = 0;
   rollbackWorks = true;
   /** ok: reboots and comes back. dead: never answers again. noboot: back without Tailscale online. ignored: no reboot happens. */
@@ -346,7 +352,7 @@ class FakeJetKvm implements Transport {
   rebooted = false;
   script = "";
   swap: {
-    state: "none" | "running" | "exited";
+    state: "none" | "running" | "starting" | "exited";
     code: number | null;
     log: string;
   } = {
@@ -363,12 +369,30 @@ class FakeJetKvm implements Transport {
       truncated?: boolean;
       badSum?: boolean;
       probeOver?: Record<string, string>;
+      /** What ssh-keyscan sees; undefined = the pinned test key. */
+      scannedKey?: string | null;
+      /** A non-JetKVM answer on /metrics. */
+      foreignMetrics?: { status: number; body: string };
     } = {},
   ) {}
+
+  scans: string[] = [];
+  scanHostKey(type: string): Promise<string | null> {
+    this.scans.push(type);
+    return Promise.resolve(
+      this.opts.scannedKey === undefined ? PINNED_KEY : this.opts.scannedKey,
+    );
+  }
 
   device(path: string): Promise<HttpResult> {
     if (this.opts.httpDown) {
       return Promise.reject(new Error("Failed to connect"));
+    }
+    if (this.opts.foreignMetrics) {
+      return Promise.resolve({
+        status: this.opts.foreignMetrics.status,
+        body: enc(this.opts.foreignMetrics.body),
+      });
     }
     if (path !== "/metrics") {
       return Promise.resolve({ status: 404, body: enc("") });
@@ -395,9 +419,15 @@ class FakeJetKvm implements Transport {
     };
   }
 
-  async ssh(command: string, stdin?: Uint8Array): Promise<SshResult> {
+  sshTimeouts: (number | undefined)[] = [];
+  async ssh(
+    command: string,
+    stdin?: Uint8Array,
+    timeoutMs?: number,
+  ): Promise<SshResult> {
     const input = stdin ? dec(stdin) : "";
     this.sshLog.push({ command, stdin: input });
+    this.sshTimeouts.push(timeoutMs);
     if (this.opts.sshDown) {
       return {
         code: 255,
@@ -428,6 +458,9 @@ class FakeJetKvm implements Transport {
       ));
     }
     if (command === "sh -s" && input === SWAP_STATE_SCRIPT) {
+      if (this.swap.state === "starting" && --this.startingChecks <= 0) {
+        this.finishSwap();
+      }
       const head = this.swap.state === "exited"
         ? `state=exited ${this.swap.code}`
         : `state=${this.swap.state}`;
@@ -457,7 +490,10 @@ class FakeJetKvm implements Transport {
     if (command.includes("nohup sh /userdata/tailscale-update.sh")) {
       // An empty script runs nothing and leaves no pid or status behind.
       if (this.script.includes("binaries swapped")) {
-        if (this.swapPlan === "noop") {
+        if (this.swapPlan === "starting") {
+          // The redirect created the log, and sh has not written its pid yet.
+          this.swap = { state: "starting", code: null, log: "" };
+        } else if (this.swapPlan === "noop") {
           this.swap = {
             state: "exited",
             code: 3,
@@ -702,7 +738,10 @@ Deno.test("tailscale update applies: verify, upload, write, launch, confirm the 
     "nohup sh /userdata/tailscale-update.sh",
   );
   assertStringIncludes(writes[2].command, "< /dev/null");
-  assertEquals(writes.length, 3);
+  // After the node is proven back: prune backups, keeping the one just made.
+  assertStringIncludes(writes[3].command, "/userdata/tailscale/backup-*");
+  assertStringIncludes(writes[3].command, `backup-${OLD}`);
+  assertEquals(writes.length, 4);
 });
 
 Deno.test("tailscale update refuses a tarball whose sha256 does not match, before touching the device", async () => {
@@ -914,6 +953,9 @@ for (
   });
 }
 
+const PINNED_KEY =
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID5AESOfH5LKGSwMVNdO1iK1L2c4wZNfxsNt1KrD9BAp";
+
 // ---------------------------------------------------------------------------
 // tailnet probe
 // ---------------------------------------------------------------------------
@@ -925,7 +967,14 @@ const tsCodes = (over: Record<string, unknown>) =>
 
 Deno.test("tailnet: answering on the configured IP adds no finding", () => {
   assertEquals(
-    tsCodes({ tailnet: { ip: "198.51.100.7", reachable: true, error: null } }),
+    tsCodes({
+      tailnet: {
+        ip: "198.51.100.7",
+        reachable: true,
+        sameDevice: true,
+        error: null,
+      },
+    }),
     [],
   );
 });
@@ -933,7 +982,12 @@ Deno.test("tailnet: answering on the configured IP adds no finding", () => {
 Deno.test("tailnet: a node deleted from the tailnet still says Running and online; only the probe catches it", () => {
   assertEquals(
     tsCodes({
-      tailnet: { ip: "198.51.100.7", reachable: false, error: "curl exit 28" },
+      tailnet: {
+        ip: "198.51.100.7",
+        reachable: false,
+        sameDevice: null,
+        error: "curl exit 28",
+      },
     }),
     ["warn tailscale_unreachable"],
   );
@@ -941,7 +995,12 @@ Deno.test("tailnet: a node deleted from the tailnet still says Running and onlin
 
 Deno.test("tailnet: a re-added node with a new IP warns and names both", () => {
   const r = evaluateHealth(facts(parseProbe(probeText()), {
-    tailnet: { ip: "198.51.100.9", reachable: false, error: null },
+    tailnet: {
+      ip: "198.51.100.9",
+      reachable: false,
+      sameDevice: null,
+      error: null,
+    },
   }));
   const f = r.findings.find((x) => x.code === "tailscale_ip_changed")!;
   assertEquals(f.severity, "warn");
@@ -982,7 +1041,12 @@ Deno.test("health fetches /metrics on the tailnet IP and nothing else there", as
     { "192.0.2.10": lan, "198.51.100.7": tailnet },
     { host: "192.0.2.10", tailnetIp: "198.51.100.7" },
   );
-  assertEquals(d.tailnet, { ip: "198.51.100.7", reachable: true, error: null });
+  assertEquals(d.tailnet, {
+    ip: "198.51.100.7",
+    reachable: true,
+    sameDevice: null,
+    error: null,
+  });
   assert(!d.findings.some((f: any) => f.code === "tailscale_unreachable"));
   assertEquals(tailnet.sshLog.length, 0, "no SSH over the tailnet");
   assertEquals(tailnet.fetchLog.length, 0);
@@ -1019,4 +1083,193 @@ Deno.test("tailnetIp must be an IPv4 literal", () => {
     threw = true;
   }
   assert(threw);
+});
+
+Deno.test("tailnet probe: a pinned host key that matches proves the same device", async () => {
+  const tail = new FakeJetKvm();
+  const d = await runHealthVia(
+    { "192.0.2.10": new FakeJetKvm(), "198.51.100.7": tail },
+    { host: "192.0.2.10", tailnetIp: "198.51.100.7", hostKey: PINNED_KEY },
+  );
+  assertEquals(d.tailnet.sameDevice, true);
+  assertEquals(tail.scans, ["ssh-ed25519"]);
+  assertEquals(
+    tail.sshLog.length,
+    0,
+    "the probe never logs in over the tailnet",
+  );
+});
+
+Deno.test("tailnet probe: a different host key, or a non-JetKVM answer, is tailscale_wrong_device", async () => {
+  for (
+    const opts of [
+      {
+        scannedKey:
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTHERKEYOTHERKEYOTHERKEYOTHERKEYOTHERKEYOTH",
+      },
+      { foreignMetrics: { status: 200, body: "<html>not a jetkvm</html>" } },
+      { foreignMetrics: { status: 404, body: "" } },
+    ]
+  ) {
+    const d = await runHealthVia(
+      { "192.0.2.10": new FakeJetKvm(), "198.51.100.7": new FakeJetKvm(opts) },
+      { host: "192.0.2.10", tailnetIp: "198.51.100.7", hostKey: PINNED_KEY },
+    );
+    assertEquals(d.tailnet.reachable, true, JSON.stringify(opts));
+    assertEquals(d.tailnet.sameDevice, false, JSON.stringify(opts));
+    assert(
+      d.findings.some((f: any) => f.code === "tailscale_wrong_device"),
+      JSON.stringify(opts),
+    );
+  }
+});
+
+Deno.test("tailnet probe transport carries no login material and a capped timeout", async () => {
+  const seen: any[] = [];
+  const fakes: Record<string, FakeJetKvm> = {
+    "192.0.2.10": new FakeJetKvm(),
+    "198.51.100.7": new FakeJetKvm(),
+  };
+  const orig = transportFactory.create;
+  transportFactory.create = (g) => (seen.push(g), fakes[g.host]);
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: model.globalArguments.parse({
+        host: "192.0.2.10",
+        tailnetIp: "198.51.100.7",
+        hostKey: PINNED_KEY,
+        sshKeyFile: "/keys/id_ed25519",
+      }),
+    });
+    await model.methods.health.execute(parseArgs("health", {}), context as any);
+  } finally {
+    transportFactory.create = orig;
+  }
+  const tg = seen.find((g) => g.host === "198.51.100.7");
+  assertEquals(tg.sshKeyFile, undefined);
+  assertEquals(tg.hostKey, undefined);
+  assert(tg.timeoutMs <= 10000);
+});
+
+Deno.test("with SSH down, the tailnet probe is still recorded, with its finding", async () => {
+  const d = await runHealthVia(
+    {
+      "192.0.2.10": new FakeJetKvm({ sshDown: true }),
+      "198.51.100.7": new FakeJetKvm({ httpDown: true }),
+    },
+    { host: "192.0.2.10", tailnetIp: "198.51.100.7" },
+  );
+  assertEquals(d.sshOk, false);
+  assertEquals(d.verdict, "fail");
+  assertEquals(d.tailnet.reachable, false);
+  assert(d.findings.some((f: any) => f.code === "tailscale_unreachable"));
+});
+
+Deno.test("tailnetFindings: no ip_changed when the device IP is unknown", () => {
+  const t = {
+    ip: "198.51.100.7",
+    reachable: true,
+    sameDevice: true,
+    error: null,
+  };
+  assertEquals(tailnetFindings(t, null), []);
+  assertEquals(tailnetFindings(t, "198.51.100.7"), []);
+  assertEquals(tailnetFindings(null, "198.51.100.9"), []);
+  assertEquals(tailnetFindings(t, "198.51.100.9").map((f) => f.code), [
+    "tailscale_ip_changed",
+  ]);
+});
+
+Deno.test("tailnetIp rejects out-of-range octets and leading zeros", () => {
+  for (
+    const bad of ["256.1.1.1", "198.051.100.7", "198.51.100", "kvm.example.com"]
+  ) {
+    let threw = false;
+    try {
+      model.globalArguments.parse({ host: "192.0.2.10", tailnetIp: bad });
+    } catch {
+      threw = true;
+    }
+    assert(threw, bad);
+  }
+});
+
+Deno.test("rollback script survives a dropped session and renames binaries into place", () => {
+  const s = rollbackScript(OLD);
+  assertStringIncludes(s, "trap '' HUP");
+  assertStringIncludes(s, `>>${ROLLBACK_LOG} 2>&1`);
+  assertStringIncludes(
+    s,
+    "cp -p /userdata/tailscale/backup-" + OLD + "/$b /userdata/tailscale/$b.rb",
+  );
+  assertStringIncludes(
+    s,
+    "mv /userdata/tailscale/$b.rb /userdata/tailscale/$b",
+  );
+  assert(
+    !s.includes(
+      `cp -p /userdata/tailscale/backup-${OLD}/tailscale /userdata/tailscale/backup-${OLD}/tailscaled /userdata/tailscale/`,
+    ),
+  );
+});
+
+Deno.test("pruneBackupsScript keeps only the named backup and refuses non-versions", () => {
+  const s = pruneBackupsScript(OLD);
+  assertStringIncludes(s, `/userdata/tailscale/backup-${OLD}`);
+  assertStringIncludes(s, "/userdata/tailscale/backup-*");
+  let threw = false;
+  try {
+    pruneBackupsScript("1.2.3; rm -rf /");
+  } catch {
+    threw = true;
+  }
+  assert(threw);
+});
+
+Deno.test("parseSwapState reads 'starting' (log written, pid not yet)", () => {
+  assertEquals(
+    parseSwapState(`state=starting\n---\nx\n${PROBE_END}\n`).state,
+    "starting",
+  );
+});
+
+Deno.test("the rollback runs with a budget that covers its own 20 s stop wait", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  await applied(fake);
+  const i = fake.sshLog.findIndex((l) => l.stdin.includes("ROLLBACK_DONE"));
+  assert(i >= 0);
+  assert((fake.sshTimeouts[i] ?? 0) >= 60000, String(fake.sshTimeouts[i]));
+});
+
+Deno.test("a failed rollback leaves old backups alone: pruning only follows a verified update", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  await applied(fake);
+  assert(!fake.sshLog.some((l) => l.command.includes("backup-*")));
+});
+
+Deno.test("a launch error while the swap is only 'starting' is watched, not refused or cleaned up", async () => {
+  const fake = new FakeJetKvm();
+  fake.launchCode = 255;
+  fake.swapPlan = "starting";
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "swap-unconfirmed");
+  assert(
+    !fake.sshLog.some((l) =>
+      l.command.startsWith(`rm -f /userdata/tailscale-${NEW}.tgz`)
+    ),
+    "a starting swap must not have its files removed",
+  );
+  assert(!sent(fake, "ROLLBACK_DONE"), "nor be rolled back under it");
+});
+
+Deno.test("a swap still 'starting' at the deadline is waited for, and its completion is seen", async () => {
+  const fake = new FakeJetKvm();
+  fake.launchCode = 255;
+  fake.swapPlan = "starting";
+  fake.startingChecks = 3;
+  const { w, error } = await applied(fake);
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
 });
