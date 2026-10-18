@@ -67,6 +67,13 @@ const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(20000).describe(
     "Timeout for one HTTP request or SSH command (uploads take their own).",
   ),
+  tailnetIp: z.string().regex(/^\d{1,3}(\.\d{1,3}){3}$/).optional().describe(
+    "The JetKVM's Tailscale IPv4 address. When set, `health` checks that the " +
+      "device reports this address and fetches /metrics on it — the only test " +
+      "that catches a node deleted from the tailnet, which tailscaled can keep " +
+      "reporting as Running. An IP, not a MagicDNS name: inside a container a " +
+      "short name can be completed by a search domain.",
+  ),
 });
 
 /** Validated global arguments for one JetKVM. */
@@ -445,6 +452,15 @@ export interface HealthFacts {
   strictSecurity: boolean;
   maxClockSkewSeconds: number;
   minFreeDiskPercent: number;
+  /** The fetch of /metrics on `tailnetIp`; null when no tailnetIp is set. */
+  tailnet: TailnetProbe | null;
+}
+
+/** Whether the web UI answered on the configured tailnet IP. */
+export interface TailnetProbe {
+  ip: string;
+  reachable: boolean;
+  error: string | null;
 }
 
 /** Turn device facts into findings and a verdict. Pure and exported for tests. */
@@ -558,6 +574,25 @@ export function evaluateHealth(f: HealthFacts): {
       });
     }
   }
+  if (f.tailnet && ts.installed && ts.ip && ts.ip !== f.tailnet.ip) {
+    findings.push({
+      severity: "warn",
+      code: "tailscale_ip_changed",
+      message:
+        `the device reports tailnet IP ${ts.ip}, not the configured ${f.tailnet.ip}; the node was probably re-added, so update tailnetIp`,
+    });
+  }
+  // Self.Online can lag, and a deleted node keeps saying Running: only a
+  // connection from another node proves the path.
+  if (f.tailnet && !f.tailnet.reachable) {
+    findings.push({
+      severity: "warn",
+      code: "tailscale_unreachable",
+      message: `the web UI did not answer on tailnet IP ${f.tailnet.ip}${
+        f.tailnet.error ? `: ${f.tailnet.error}` : ""
+      }`,
+    });
+  }
   if (p.devMode) {
     findings.push({
       severity: f.strictSecurity ? "warn" : "info",
@@ -614,6 +649,13 @@ const HealthSchema = z.object({
   developerMode: z.boolean().nullable(),
   tailscale: TailscaleStateSchema.nullable(),
   latestTailscale: z.string().nullable(),
+  tailnet: z.object({
+    ip: z.string(),
+    reachable: z.boolean(),
+    error: z.string().nullable(),
+  }).nullable().describe(
+    "The fetch of /metrics on tailnetIp. Null when no tailnetIp is set or SSH failed.",
+  ),
   error: z.string().nullable(),
 });
 
@@ -846,8 +888,17 @@ interface Ctx {
 /** The `@sntxrr/jetkvm` model: health and Tailscale updates for one JetKVM. */
 export const model = {
   type: "@sntxrr/jetkvm",
-  version: "2026.10.16.1",
+  version: "2026.10.18.1",
   globalArguments: GlobalArgsSchema,
+
+  upgrades: [
+    {
+      toVersion: "2026.10.18.1",
+      description:
+        "Adds the optional tailnetIp argument; health probes the tailnet path. Existing instances need no change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     health: {
@@ -869,7 +920,7 @@ export const model = {
   methods: {
     health: {
       description:
-        "Read-only health check: web UI reachability and app version (/metrics), then an SSH probe for system version, USB gadget state, disk, clock and Tailscale (version, daemon, online, boot script). Compares app/system against JetKVM's release API and Tailscale against pkgs.tailscale.com. Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
+        "Read-only health check: web UI reachability and app version (/metrics), then an SSH probe for system version, USB gadget state, disk, clock and Tailscale (version, daemon, online, boot script, and with tailnetIp set a fetch of /metrics over the tailnet). Compares app/system against JetKVM's release API and Tailscale against pkgs.tailscale.com. Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
       arguments: z.object({
         checkUpdates: z.boolean().default(true).describe(
           "Ask api.jetkvm.com and pkgs.tailscale.com for the latest versions. A failure there is logged, not counted.",
@@ -909,6 +960,7 @@ export const model = {
           developerMode: null,
           tailscale: null,
           latestTailscale: null,
+          tailnet: null,
         };
 
         let httpOk = false;
@@ -984,6 +1036,27 @@ export const model = {
           }
         }
 
+        // /metrics is unauthenticated, so a stale address that now belongs to
+        // another node learns nothing from this.
+        let tailnet: TailnetProbe | null = null;
+        if (g.tailnetIp) {
+          try {
+            const r = await transportFactory.create({ ...g, host: g.tailnetIp })
+              .device("/metrics");
+            tailnet = {
+              ip: g.tailnetIp,
+              reachable: r.status === 200,
+              error: r.status === 200 ? null : `/metrics: HTTP ${r.status}`,
+            };
+          } catch (e) {
+            tailnet = {
+              ip: g.tailnetIp,
+              reachable: false,
+              error: (e as Error).message,
+            };
+          }
+        }
+
         const { findings, verdict } = evaluateHealth({
           checkedAt,
           appVersion,
@@ -995,6 +1068,7 @@ export const model = {
           strictSecurity: args.strictSecurity,
           maxClockSkewSeconds: args.maxClockSkewSeconds,
           minFreeDiskPercent: args.minFreeDiskPercent,
+          tailnet,
         });
         if (httpError) {
           findings.unshift({
@@ -1029,6 +1103,7 @@ export const model = {
           developerMode: p.devMode,
           tailscale: p.tailscale,
           latestTailscale: latestTs,
+          tailnet,
           error: httpError,
         });
         return { dataHandles: [h] };
