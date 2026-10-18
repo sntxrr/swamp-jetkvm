@@ -62,6 +62,8 @@ with a sentinel line, and output without it fails.
 | `tailscale_offline`             | warn               | Running, but the coordination server sees it offline        |
 | `tailscale_update_available`    | warn               | pkgs.tailscale.com has a newer stable                       |
 | `tailscale_boot_script_missing` | warn               | No `S22tailscale`: Tailscale will not start after a reboot  |
+| `tailscale_unreachable`         | warn               | With `tailnetIp`: `/metrics` did not answer on that address |
+| `tailscale_ip_changed`          | warn               | With `tailnetIp`: the device reports a different tailnet IP |
 | `tailscale_not_installed`       | info               |                                                             |
 | `developer_mode_enabled`        | info (warn strict) | Root SSH is open to the installed key                       |
 
@@ -71,6 +73,15 @@ finding.
 
 The probe never reads `kvm_config.json`, which holds the password hash and the
 cloud token.
+
+**The tailnet path.** A node deleted from the tailnet does not log the device
+out: tailscaled keeps reporting `Running` with a stale peer list, so
+`tailscale_down` stays quiet until the daemon restarts. Set the `tailnetIp`
+global argument to have `health` also fetch `/metrics` on that address, which
+proves the path from the tailnet node swamp runs behind. The request is
+unauthenticated, so a stale address that now belongs to another node learns
+nothing. A re-added node gets a new address; `tailscale_ip_changed` names both,
+and the fix is updating `tailnetIp`.
 
 ### `tailscale`
 
@@ -138,6 +149,7 @@ globalArguments:
   host: 192.0.2.20
   hostKey: ssh-ed25519 AAAA...        # optional pin; else known_hosts must have it
   # sshKeyFile: /path/to/id_ed25519   # optional; default is the agent
+  # tailnetIp: 198.51.100.7           # optional: probe the Tailscale path too
 ```
 
 Requirements on the machine running swamp: `ssh` and `curl` on `PATH`, and
