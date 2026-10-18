@@ -67,7 +67,7 @@ const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(20000).describe(
     "Timeout for one HTTP request or SSH command (uploads take their own).",
   ),
-  tailnetIp: z.string().regex(/^\d{1,3}(\.\d{1,3}){3}$/).optional().describe(
+  tailnetIp: z.ipv4().optional().describe(
     "The JetKVM's Tailscale IPv4 address. When set, `health` checks that the " +
       "device reports this address and fetches /metrics on it — the only test " +
       "that catches a node deleted from the tailnet, which tailscaled can keep " +
@@ -108,6 +108,11 @@ export interface Transport {
   ): Promise<SshResult>;
   /** GET a public URL with full TLS verification (release APIs, tarballs). */
   fetch(url: string, timeoutMs?: number): Promise<HttpResult>;
+  /**
+   * The device's SSH host key of the pinned type, read with ssh-keyscan:
+   * anonymous (no key is offered), so it is safe against any address.
+   */
+  scanHostKey(type: string): Promise<string | null>;
 }
 
 /** The `ssh` argv for one command. Pure and exported for tests. */
@@ -156,9 +161,9 @@ async function run(
   stdin: Uint8Array,
   timeoutMs: number,
 ): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
-  // Only `ssh` and `curl`, with argv built from schema-validated globals
-  // (sshArgs, device): there is no swamp primitive for SSH, and the device's
-  // self-signed TLS needs curl.
+  // Only `ssh`, `ssh-keyscan` and `curl`, with argv built from schema-validated
+  // globals (sshArgs, device, scanHostKey): there is no swamp primitive for
+  // SSH, and the device's self-signed TLS needs curl.
   // swamp-quality-ignore deno-command
   const child = new Deno.Command(cmd, {
     args,
@@ -198,7 +203,16 @@ export class CliTransport implements Transport {
     const outFile = await Deno.makeTempFile({ prefix: "jetkvm-" });
     try {
       const args = [
+        // -q first: never read ~/.curlrc. --noproxy: reach the device directly,
+        // or the tailnet probe would test the proxy's path, not this host's.
+        "-q",
+        "--noproxy",
+        "*",
         "-sS",
+        // A deleted tailnet node black-holes packets; fail the connect fast
+        // instead of waiting out the whole budget.
+        "--connect-timeout",
+        String(Math.max(1, Math.min(10, Math.ceil(this.g.timeoutMs / 1000)))),
         "--max-time",
         String(Math.ceil(this.g.timeoutMs / 1000)),
         "-o",
@@ -237,11 +251,11 @@ export class CliTransport implements Transport {
     // A per-call known_hosts file, removed afterwards: it holds only the
     // public host key, but nothing should be left in the temp dir.
     let knownHosts: string | null = null;
-    if (this.g.hostKey) {
-      knownHosts = await Deno.makeTempFile({ prefix: "jetkvm-kh-" });
-      await Deno.writeTextFile(knownHosts, `jetkvm ${this.g.hostKey}\n`);
-    }
     try {
+      if (this.g.hostKey) {
+        knownHosts = await Deno.makeTempFile({ prefix: "jetkvm-kh-" });
+        await Deno.writeTextFile(knownHosts, `jetkvm ${this.g.hostKey}\n`);
+      }
       const res = await run(
         "ssh",
         sshArgs(this.g, knownHosts, command),
@@ -256,6 +270,28 @@ export class CliTransport implements Transport {
     } finally {
       if (knownHosts) await Deno.remove(knownHosts).catch(() => {});
     }
+  }
+
+  async scanHostKey(type: string): Promise<string | null> {
+    const res = await run(
+      "ssh-keyscan",
+      [
+        "-T",
+        String(Math.max(1, Math.min(10, Math.ceil(this.g.timeoutMs / 1000)))),
+        "-t",
+        type,
+        "-p",
+        String(this.g.sshPort),
+        "--",
+        this.g.host,
+      ],
+      new Uint8Array(),
+      this.g.timeoutMs + 5000,
+    );
+    const line = new TextDecoder().decode(res.stdout).split("\n")
+      .find((l) => l && !l.startsWith("#"));
+    const f = line?.trim().split(/\s+/);
+    return f && f.length >= 3 ? `${f[1]} ${f[2]}` : null;
   }
 
   async fetch(url: string, timeoutMs = this.g.timeoutMs): Promise<HttpResult> {
@@ -459,8 +495,53 @@ export interface HealthFacts {
 /** Whether the web UI answered on the configured tailnet IP. */
 export interface TailnetProbe {
   ip: string;
+  /** Anything answered over HTTP. */
   reachable: boolean;
+  /**
+   * The answer came from this JetKVM: a /metrics page with jetkvm_build_info,
+   * and the pinned SSH host key on that address. False when something else
+   * answers; null when it could not be judged (no hostKey pinned).
+   */
+  sameDevice: boolean | null;
   error: string | null;
+}
+
+/**
+ * Findings for the tailnet probe. `deviceIp` is the tailnet IP the device
+ * reports, or null when unknown. Pure and exported for tests.
+ */
+export function tailnetFindings(
+  tailnet: TailnetProbe | null,
+  deviceIp: string | null,
+): Finding[] {
+  if (!tailnet) return [];
+  const out: Finding[] = [];
+  if (deviceIp && deviceIp !== tailnet.ip) {
+    out.push({
+      severity: "warn",
+      code: "tailscale_ip_changed",
+      message:
+        `the device reports tailnet IP ${deviceIp}, not the configured ${tailnet.ip}; the node was probably re-added, so update tailnetIp`,
+    });
+  }
+  const why = tailnet.error ? `: ${tailnet.error}` : "";
+  if (!tailnet.reachable) {
+    // Self.Online can lag, and a deleted node keeps saying Running: only a
+    // connection from another node proves the path.
+    out.push({
+      severity: "warn",
+      code: "tailscale_unreachable",
+      message: `nothing answered on tailnet IP ${tailnet.ip}${why}`,
+    });
+  } else if (tailnet.sameDevice === false) {
+    out.push({
+      severity: "warn",
+      code: "tailscale_wrong_device",
+      message:
+        `something other than this JetKVM answers on tailnet IP ${tailnet.ip}${why}`,
+    });
+  }
+  return out;
 }
 
 /** Turn device facts into findings and a verdict. Pure and exported for tests. */
@@ -574,25 +655,9 @@ export function evaluateHealth(f: HealthFacts): {
       });
     }
   }
-  if (f.tailnet && ts.installed && ts.ip && ts.ip !== f.tailnet.ip) {
-    findings.push({
-      severity: "warn",
-      code: "tailscale_ip_changed",
-      message:
-        `the device reports tailnet IP ${ts.ip}, not the configured ${f.tailnet.ip}; the node was probably re-added, so update tailnetIp`,
-    });
-  }
-  // Self.Online can lag, and a deleted node keeps saying Running: only a
-  // connection from another node proves the path.
-  if (f.tailnet && !f.tailnet.reachable) {
-    findings.push({
-      severity: "warn",
-      code: "tailscale_unreachable",
-      message: `the web UI did not answer on tailnet IP ${f.tailnet.ip}${
-        f.tailnet.error ? `: ${f.tailnet.error}` : ""
-      }`,
-    });
-  }
+  findings.push(
+    ...tailnetFindings(f.tailnet, ts.installed ? ts.ip : null),
+  );
   if (p.devMode) {
     findings.push({
       severity: f.strictSecurity ? "warn" : "info",
@@ -652,9 +717,10 @@ const HealthSchema = z.object({
   tailnet: z.object({
     ip: z.string(),
     reachable: z.boolean(),
+    sameDevice: z.boolean().nullable(),
     error: z.string().nullable(),
   }).nullable().describe(
-    "The fetch of /metrics on tailnetIp. Null when no tailnetIp is set or SSH failed.",
+    "The anonymous probe of tailnetIp (/metrics and the SSH host key). Null when no tailnetIp is set. Recorded even when SSH on the LAN fails.",
   ),
   error: z.string().nullable(),
 });
@@ -748,6 +814,7 @@ export const SWAP_SH = "/userdata/tailscale-update.sh";
 export const SWAP_LOG = "/userdata/tailscale-update.log";
 export const SWAP_PID = "/userdata/tailscale-update.pid";
 export const SWAP_STATUS = "/userdata/tailscale-update.status";
+export const ROLLBACK_LOG = "/userdata/tailscale-rollback.log";
 
 /**
  * The on-device swap, run detached so that it finishes even if the SSH
@@ -814,15 +881,36 @@ export function rollbackScript(fromVersion: string): string {
     );
   }
   const backup = `${TS_DIR}/backup-${fromVersion}`;
+  // A dropped SSH session must not abort the restore half-way: ignore HUP,
+  // and send the init script's chatter to a log so a closed pipe cannot hit
+  // it. Copy beside the binaries and rename over them: cp onto a still
+  // running tailscaled fails ETXTBSY, a rename does not.
   return `[ -x ${backup}/tailscale ] && [ -x ${backup}/tailscaled ] || { echo "no complete backup at ${backup}"; exit 3; }
-trap 'pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start' EXIT
+trap '' HUP
+trap 'pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start >>${ROLLBACK_LOG} 2>&1' EXIT
 set -e
-${TS_BOOT} stop || true
+${TS_BOOT} stop >>${ROLLBACK_LOG} 2>&1 || true
 i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
-cp -p ${backup}/tailscale ${backup}/tailscaled ${TS_DIR}/
-${TS_BOOT} start
+for b in tailscale tailscaled; do
+  cp -p ${backup}/$b ${TS_DIR}/$b.rb
+  mv ${TS_DIR}/$b.rb ${TS_DIR}/$b
+done
+${TS_BOOT} start >>${ROLLBACK_LOG} 2>&1
 echo ROLLBACK_DONE
 `;
+}
+
+/**
+ * Remove every Tailscale backup except the one for `keepVersion`. Pure and
+ * exported for tests; the version is validated, so nothing else reaches sh.
+ */
+export function pruneBackupsScript(keepVersion: string): string {
+  if (!TS_VERSION.test(keepVersion)) {
+    throw new Error(
+      "refusing to build a prune script from a non-version string",
+    );
+  }
+  return `for d in ${TS_DIR}/backup-*; do [ -d "$d" ] && [ "$d" != ${TS_DIR}/backup-${keepVersion} ] && rm -rf "$d"; done; true`;
 }
 
 /** Report the detached swap's state and log. Read-only. */
@@ -830,6 +918,7 @@ export const SWAP_STATE_SCRIPT =
   `if [ -f ${SWAP_STATUS} ]; then echo "state=exited $(cat ${SWAP_STATUS})"
 elif [ -f ${SWAP_PID} ] && kill -0 "$(cat ${SWAP_PID})" 2>/dev/null; then echo "state=running"
 elif [ -f ${SWAP_PID} ]; then echo "state=vanished"
+elif [ -f ${SWAP_LOG} ]; then echo "state=starting"
 else echo "state=none"; fi
 echo "---"
 cat ${SWAP_LOG} 2>/dev/null
@@ -838,7 +927,8 @@ echo "${PROBE_END}"
 
 /** What the detached swap is doing. `unknown` when the device could not say. */
 export interface SwapState {
-  state: "running" | "exited" | "vanished" | "none" | "unknown";
+  /** starting: the log exists but the pid is not written yet; treat as running. */
+  state: "running" | "starting" | "exited" | "vanished" | "none" | "unknown";
   exitCode: number | null;
   log: string;
 }
@@ -850,7 +940,9 @@ export function parseSwapState(stdout: string | null): SwapState {
   }
   const [head, ...rest] = stdout.split("\n---\n");
   const log = rest.join("\n---\n").replace(PROBE_END, "").trim();
-  const m = head.match(/state=(running|exited|vanished|none)(?: (\d+))?/);
+  const m = head.match(
+    /state=(running|starting|exited|vanished|none)(?: (\d+))?/,
+  );
   if (!m) return { state: "unknown", exitCode: null, log };
   return {
     state: m[1] as SwapState["state"],
@@ -888,7 +980,7 @@ interface Ctx {
 /** The `@sntxrr/jetkvm` model: health and Tailscale updates for one JetKVM. */
 export const model = {
   type: "@sntxrr/jetkvm",
-  version: "2026.10.18.1",
+  version: "2026.10.18.2",
   globalArguments: GlobalArgsSchema,
 
   upgrades: [
@@ -896,6 +988,12 @@ export const model = {
       toVersion: "2026.10.18.1",
       description:
         "Adds the optional tailnetIp argument; health probes the tailnet path. Existing instances need no change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.18.2",
+      description:
+        "No argument change. Review fixes: the tailnet probe runs before SSH and proves identity (jetkvm_build_info and the pinned host key, read anonymously); the rollback has a budget that covers its own stop wait and survives a dropped session; old backups are pruned after a verified update.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -920,7 +1018,7 @@ export const model = {
   methods: {
     health: {
       description:
-        "Read-only health check: web UI reachability and app version (/metrics), then an SSH probe for system version, USB gadget state, disk, clock and Tailscale (version, daemon, online, boot script, and with tailnetIp set a fetch of /metrics over the tailnet). Compares app/system against JetKVM's release API and Tailscale against pkgs.tailscale.com. Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
+        "Read-only health check: web UI reachability and app version (/metrics), then an SSH probe for system version, USB gadget state, disk, clock and Tailscale (version, daemon, online, boot script, and with tailnetIp an anonymous probe over the tailnet that also checks the same device answers). Compares app/system against JetKVM's release API and Tailscale against pkgs.tailscale.com. Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
       arguments: z.object({
         checkUpdates: z.boolean().default(true).describe(
           "Ask api.jetkvm.com and pkgs.tailscale.com for the latest versions. A failure there is logged, not counted.",
@@ -943,6 +1041,7 @@ export const model = {
         const g = context.globalArgs;
         const t = transportFactory.create(g);
         const checkedAt = new Date();
+        context.logger.info("JetKVM {host}: checking health", { host: g.host });
         context.logger.info("JetKVM {host}: health check", { host: g.host });
         const blank = {
           host: g.host,
@@ -979,6 +1078,62 @@ export const model = {
           httpError = (e as Error).message;
         }
 
+        // The tailnet probe does not depend on SSH, so it runs first and is
+        // recorded on every path: with the LAN down it is what tells "device
+        // dead" from "LAN broken". It is anonymous, so a stale address that now
+        // belongs to another node learns nothing: /metrics needs no login, and
+        // ssh-keyscan offers no key. Its transport is built from the address
+        // and timeouts only, so it cannot be used to log in.
+        let tailnet: TailnetProbe | null = null;
+        if (g.tailnetIp) {
+          const tt = transportFactory.create({
+            host: g.tailnetIp,
+            scheme: g.scheme,
+            sshUser: g.sshUser,
+            sshPort: g.sshPort,
+            timeoutMs: Math.min(g.timeoutMs, 10000),
+          });
+          try {
+            const r = await tt.device("/metrics");
+            const isJetkvm = r.status === 200 &&
+              parseMetrics(new TextDecoder().decode(r.body)).has(
+                "jetkvm_build_info",
+              );
+            let sameKey: boolean | null = null;
+            if (isJetkvm && g.hostKey) {
+              const seen = await tt.scanHostKey(g.hostKey.split(" ")[0])
+                .catch(() => null);
+              sameKey = seen === null ? null : seen === g.hostKey;
+            }
+            tailnet = {
+              ip: g.tailnetIp,
+              reachable: true,
+              sameDevice: isJetkvm ? sameKey : false,
+              error: !isJetkvm
+                ? `/metrics answered HTTP ${r.status} without jetkvm_build_info`
+                : sameKey === false
+                ? "a JetKVM answered, with a different SSH host key than the pinned one"
+                : null,
+            };
+          } catch (e) {
+            tailnet = {
+              ip: g.tailnetIp,
+              reachable: false,
+              sameDevice: null,
+              error: (e as Error).message,
+            };
+          }
+          context.logger.info(
+            "JetKVM {host}: tailnet {ip} reachable={reachable} sameDevice={same}",
+            {
+              host: g.host,
+              ip: g.tailnetIp,
+              reachable: tailnet.reachable,
+              same: String(tailnet.sameDevice),
+            },
+          );
+        }
+
         let p: Probe;
         try {
           p = await probe(t);
@@ -999,6 +1154,7 @@ export const model = {
               `${msg}. Needs developer mode on, this key authorised, and a known host key`,
           });
           context.logger.warn("JetKVM {host}: {msg}", { host: g.host, msg });
+          findings.push(...tailnetFindings(tailnet, null));
           const h = await context.writeResource("health", "health", {
             ...blank,
             appVersion,
@@ -1007,6 +1163,7 @@ export const model = {
             sshOk: false,
             verdict: "fail",
             findings,
+            tailnet,
             error: httpError ? `${httpError}; ${msg}` : msg,
           });
           return { dataHandles: [h] };
@@ -1033,27 +1190,6 @@ export const model = {
               });
               return null;
             });
-          }
-        }
-
-        // /metrics is unauthenticated, so a stale address that now belongs to
-        // another node learns nothing from this.
-        let tailnet: TailnetProbe | null = null;
-        if (g.tailnetIp) {
-          try {
-            const r = await transportFactory.create({ ...g, host: g.tailnetIp })
-              .device("/metrics");
-            tailnet = {
-              ip: g.tailnetIp,
-              reachable: r.status === 200,
-              error: r.status === 200 ? null : `/metrics: HTTP ${r.status}`,
-            };
-          } catch (e) {
-            tailnet = {
-              ip: g.tailnetIp,
-              reachable: false,
-              error: (e as Error).message,
-            };
           }
         }
 
@@ -1148,6 +1284,13 @@ export const model = {
       ): Promise<{ dataHandles: unknown[] }> => {
         const g = context.globalArgs;
         const t = transportFactory.create(g);
+        context.logger.info("JetKVM {host}: tailscale {action}{mode}", {
+          host: g.host,
+          action: args.action,
+          mode: args.action === "update"
+            ? (args.apply ? " (apply)" : " (dry run)")
+            : "",
+        });
         const before = await probe(t);
         const ts = before.tailscale;
         const latest = await latestTailscale(t).catch((e) => {
@@ -1160,7 +1303,7 @@ export const model = {
         const steps: string[] = [];
         const record = (rec: {
           applied: boolean;
-          outcome: string;
+          outcome: z.infer<typeof TailscaleSchema>["outcome"];
           message: string;
           after?: Probe["tailscale"] | null;
           sha256?: string | null;
@@ -1376,14 +1519,33 @@ export const model = {
           const elapsed = Date.now() - started;
           if (elapsed < args.rejoinTimeoutMs) continue;
           st = await swapState(t);
-          if (st.state !== "running" || elapsed >= 2 * args.rejoinTimeoutMs) {
+          const live = st.state === "running" || st.state === "starting";
+          if (!live || elapsed >= 2 * args.rejoinTimeoutMs) {
             break;
           }
         }
+        // The state check runs after this round's probe, so a swap seen to
+        // exit just now was judged on the probe from before it finished:
+        // look once more before deciding, or a late success reads as failed.
+        if (!(after && rejoined(after)) && st.state === "exited") {
+          after = await probe(t).then((p) => p.tailscale).catch(() => after);
+        }
 
         if (after && rejoined(after)) {
+          // Each update leaves a ~65 MB backup. Once the new version is proven,
+          // keep only the one this update replaced: it is the rollback source.
+          const keep = `${TS_DIR}/backup-${ts.version}`;
+          const pruned = await t.ssh(pruneBackupsScript(ts.version!)).catch(
+            (e) => ({ code: -1, stdout: "", stderr: (e as Error).message }),
+          );
+          if (pruned.code !== 0) {
+            context.logger.warn(
+              "could not prune old Tailscale backups on {host}: {msg}",
+              { host: g.host, msg: pruned.stderr.trim() },
+            );
+          }
           const done =
-            `updated ${ts.version} → ${target}; Running, online, ${after.ip}. Backup kept in ${TS_DIR}/backup-${ts.version}/`;
+            `updated ${ts.version} → ${target}; Running, online, ${after.ip}. Backup kept in ${keep}/`;
           if (!args.rebootAfter) {
             context.logger.info("{host}: {msg}", { host: g.host, msg: done });
             const h = await record({
@@ -1473,7 +1635,10 @@ export const model = {
 
         // 5a. The script is still running, or the device cannot say: rolling
         // back now would race it. Leave it to a human, with what is known.
-        if (st.state === "running" || st.state === "unknown") {
+        if (
+          st.state === "running" || st.state === "starting" ||
+          st.state === "unknown"
+        ) {
           await record({
             applied: true,
             outcome: "swap-unconfirmed",
@@ -1509,9 +1674,12 @@ export const model = {
           "Tailscale on {host} did not rejoin as {to}; rolling back. Swap log: {log}",
           { host: g.host, to: target, log: logText },
         );
+        // The script can wait 20 s for the daemon to stop before it copies:
+        // the default per-command timeout would kill it mid-restore.
         const rbk = await t.ssh(
           "sh -s",
           new TextEncoder().encode(rollbackScript(ts.version!)),
+          Math.max(g.timeoutMs, 60000) + 30000,
         ).catch((e) => ({
           code: -1,
           stdout: "",
