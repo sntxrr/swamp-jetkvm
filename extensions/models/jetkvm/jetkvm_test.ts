@@ -359,9 +359,10 @@ class FakeJetKvm implements Transport {
   rollbackWorks = true;
   /** Whether the restored old version comes back online. */
   rollbackOnline = true;
-  /** tailscaled running; noopDown takes it down when a noop swap exits. */
-  daemonUp = true;
-  noopDown = false;
+  /** A backend state shown until the swap finishes (a broken device the update fixes). */
+  backendBefore: string | null = null;
+  /** The backend state the restored old version comes back in (null: Running). */
+  rollbackBackend: string | null = null;
   /** ok: reboots and comes back. dead: never answers again. noboot: back without Tailscale online. ignored: no reboot happens. */
   rebootOutcome: "ok" | "dead" | "noboot" | "ignored" = "ok";
   rebootCode = 0;
@@ -428,6 +429,7 @@ class FakeJetKvm implements Transport {
 
   private finishSwap() {
     this.tsVersion = NEW;
+    this.backendBefore = null;
     if (this.swapPlan === "stuck") this.online = false;
     this.swap = {
       state: "exited",
@@ -467,7 +469,7 @@ class FakeJetKvm implements Transport {
         {
           ts_version: this.tsVersion,
           ts_daemon_version: this.tsVersion,
-          ts_daemon: this.daemonUp ? "1" : "0",
+          ...(this.backendBefore ? { ts_backend: this.backendBefore } : {}),
           ts_online: String(this.online),
           uptime: String(this.uptime),
           boot_id: this.bootId,
@@ -491,6 +493,7 @@ class FakeJetKvm implements Transport {
       }
       this.tsVersion = OLD;
       this.online = this.rollbackOnline;
+      this.backendBefore = this.rollbackBackend;
       return this.ok("ROLLBACK_DONE\n");
     }
     if (command.startsWith(`cat > /userdata/tailscale-${NEW}.tgz`)) {
@@ -520,7 +523,6 @@ class FakeJetKvm implements Transport {
             log: "backup ready\nswapping binaries\nexit 143",
           };
         } else if (this.swapPlan === "noop") {
-          if (this.noopDown) this.daemonUp = false;
           this.swap = {
             state: "exited",
             code: 3,
@@ -2056,9 +2058,8 @@ Deno.test("an unchanged swap that left tailscaled down says so", async () => {
   const { w } = await applied(fake, {});
   assertEquals(w.outcome, "unchanged");
   assert(!w.message.includes("NOT RUNNING"), w.message);
-  const down = new FakeJetKvm();
+  const down = new FakeJetKvm({ probeOver: { ts_daemon: "0" } });
   down.swapPlan = "noop";
-  down.noopDown = true;
   const r = await applied(down);
   assertEquals(r.w.outcome, "unchanged");
   assertStringIncludes(r.w.message, "TAILSCALED IS NOT RUNNING NORMALLY");
@@ -2072,10 +2073,9 @@ Deno.test("a rollback whose old version never comes back online is rollback-fail
   assertEquals(w.outcome, "rollback-failed");
 });
 
-Deno.test("a rollback on a device whose online state was unreadable before needs only Running, not online", async () => {
-  // Offline before is refused up front; unreadable is not, and must not be
-  // held to more than it showed.
-  const fake = new FakeJetKvm({ probeOver: { ts_online: "" } });
+Deno.test("a rollback on a device that was offline before the update needs only Running, not online", async () => {
+  const fake = new FakeJetKvm();
+  fake.online = false; // offline before the update
   fake.swapPlan = "stuck";
   fake.rollbackOnline = false;
   const { w } = await applied(fake);
@@ -2090,27 +2090,27 @@ Deno.test("the rollback logs to its log file, never to the SSH session", () => {
   );
 });
 
-Deno.test("an update refuses a device whose tailscaled is down or offline: it could only roll back", async () => {
-  for (
-    const [over, msg] of [
-      [{ ts_daemon: "0" }, "not running"],
-      [{ ts_backend: "NeedsLogin" }, "in state NeedsLogin"],
-      [{ ts_online: "false" }, "offline"],
-    ] as const
-  ) {
-    const fake = new FakeJetKvm({ probeOver: over });
-    const { w, error } = await applied(fake);
-    assertEquals(w.outcome, "refused", msg);
-    assertStringIncludes(String(error), msg);
-    assertEquals(deviceWrites(fake).length, 0, msg);
-    const r = await runCheck("tailscale-installed", {
-      "192.0.2.10": new FakeJetKvm({ probeOver: over }),
-    });
-    assertEquals(r.pass, false, msg);
-  }
-  // Unreadable online state: not refused.
-  const quiet = await runCheck("tailscale-installed", {
-    "192.0.2.10": new FakeJetKvm({ probeOver: { ts_online: "" } }),
-  });
-  assertEquals(quiet.pass, true);
+Deno.test("a device that was logged out before the update: the update may fix it, and a failed one restores without a false alarm", async () => {
+  const fixes = new FakeJetKvm();
+  fixes.backendBefore = "NeedsLogin";
+  const ok = await applied(fixes);
+  assertEquals(ok.w.outcome, "done");
+
+  const stays = new FakeJetKvm({ probeOver: { ts_backend: "NeedsLogin" } });
+  const { w } = await applied(stays);
+  assertEquals(w.outcome, "rolled-back", w.message);
+});
+
+Deno.test("a device whose daemon was down before: a failed update that restores it to down is rolled-back", async () => {
+  const fake = new FakeJetKvm({ probeOver: { ts_daemon: "0" } });
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rolled-back", w.message);
+});
+
+Deno.test("a device that was Running before, restored but not Running, is rollback-failed", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  fake.rollbackBackend = "NeedsLogin";
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rollback-failed");
 });

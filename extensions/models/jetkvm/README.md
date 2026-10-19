@@ -111,8 +111,7 @@ resource.
 
 Moves to `version`, or to the current stable when no version is given. It
 refuses a downgrade unless `allowDowngrade: true` is passed. It also refuses
-when Tailscale is not installed, when tailscaled is not `Running` and online
-(an update from there could only roll back), when `tailscale` and `tailscaled` report
+when Tailscale is not installed, when `tailscale` and `tailscaled` report
 different versions, when the boot script is missing, when
 `/userdata` has less than 256 MB free, and (with `tailnetIp`) when the device
 does not already answer over the tailnet from the swamp host: an update that
@@ -141,8 +140,9 @@ cannot be verified would only roll back. It:
    the backup, restarts the daemon, records `rolled-back` and fails. The
    restore ignores a dropped session, kills a daemon that will not stop, and
    renames the binaries into place, so it cannot be left half-done. It counts
-   as restored only once the old version is Running again (and online, if it
-   was online before the update).
+   as restored once the old version is back in the state it had before the
+   update: Running and online only if it was, so a device the update was meant
+   to fix is not reported as a failed restore.
 6. After a verified update, removes every backup except the one it just made
    (each is about 65 MB), so the version it replaced stays restorable.
 
@@ -190,7 +190,7 @@ method). The first three share one SSH probe.
 
 | Check                   | Fails when                                                        |
 | ----------------------- | ----------------------------------------------------------------- |
-| `tailscale-installed`   | Tailscale is missing, its version is unreadable, `tailscaled` is on another version, or it is not Running and online |
+| `tailscale-installed`   | Tailscale is missing, its version is unreadable, or `tailscaled` is on another version |
 | `tailscale-boot-script` | `S22tailscale` is missing                                         |
 | `userdata-free-space`   | `/userdata` free space is unreadable or under 256 MB              |
 | `tailnet-path`          | With `tailnetIp`: the device does not answer over the tailnet now |
