@@ -1933,7 +1933,10 @@ export const model = {
 
     tailscaleUpdate: {
       description:
-        "Update Tailscale on the JetKVM. Always acts; plan first with `tailscale` action update. The device has no CA store, so `tailscale update` cannot run there: this method downloads the official arm tarball on the swamp host, checks its sha256, streams it over SSH, backs up the running binaries, swaps them, re-runs `tailscale configure jetkvm` and restarts tailscaled without a reboot. It then waits for the node to be Running and online with the same tailnet IP and, with tailnetIp, to answer anonymously over the tailnet from the swamp host; otherwise it restores the backup by itself. The labeled `live` pre-flight checks run first; the method enforces the same conditions itself.",
+        "Update Tailscale on the JetKVM. Always acts; plan first with `tailscale` action update. " +
+        "The device has no CA store, so `tailscale update` cannot run there: this method downloads the official arm tarball on the swamp host, checks its sha256, streams it over SSH, backs up the running binaries, swaps them, re-runs `tailscale configure jetkvm` and restarts tailscaled without a reboot. " +
+        "It then waits for the node to be Running and online with the same tailnet IP and, with tailnetIp, to answer anonymously over the tailnet from the swamp host; otherwise it restores the backup by itself. " +
+        "The labeled `live` pre-flight checks run first; the method enforces the same conditions itself.",
       arguments: z.object(UpdateArgsShape),
       execute: async (
         args: Omit<TailscaleRunArgs, "action" | "apply">,
