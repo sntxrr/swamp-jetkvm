@@ -36,10 +36,16 @@ WebRTC and decoding H.264, which this model does not do.
 
 ## Methods
 
-| Method      | Writes?          | What it does                                                         |
-| ----------- | ---------------- | -------------------------------------------------------------------- |
-| `health`    | no               | Reachability, firmware and Tailscale currency, USB, disk, clock      |
-| `tailscale` | **with `apply`** | Tailscale status, or update it to the current stable or a pinned one |
+| Method            | Writes?    | What it does                                                    |
+| ----------------- | ---------- | --------------------------------------------------------------- |
+| `health`          | no         | Reachability, firmware and Tailscale currency, USB, disk, clock |
+| `tailscale`       | no         | Tailscale status, or the plan for an update                     |
+| `tailscaleUpdate` | **always** | Update Tailscale to the current stable or a pinned version      |
+
+Reads and writes are separate methods (since 2026.10.19.1). Before that,
+`tailscale` updated when passed `apply: true`; it now **refuses** `apply: true`
+rather than ignoring it, so a caller written for the old method fails loudly
+instead of silently becoming a dry run.
 
 ### `health`
 
@@ -95,11 +101,18 @@ address; `tailscale_ip_changed` names both, and the fix is updating `tailnetIp`.
 `action: status` (default) records the installed version, daemon state, online
 state and tailnet IP, and the current stable.
 
-`action: update` moves to `version`, or to the current stable when no version
-is given. It refuses a downgrade unless `allowDowngrade: true` is passed. It
-also refuses when Tailscale is not installed, when the boot script is missing,
-and when `/userdata` has less than 200 MB free. The dry run lists every step.
-With `apply: true` it:
+`action: update` records the plan for `tailscaleUpdate` with the same
+arguments: every step it would take, or the refusal it would hit. It never
+changes the device.
+
+### `tailscaleUpdate`
+
+Moves to `version`, or to the current stable when no version is given. It
+refuses a downgrade unless `allowDowngrade: true` is passed. It also refuses
+when Tailscale is not installed, when the boot script is missing, when
+`/userdata` has less than 200 MB free, and (with `tailnetIp`) when the device
+does not already answer over the tailnet from the swamp host: an update that
+cannot be verified would only roll back. It:
 
 1. Downloads `tailscale_<ver>_arm.tgz` and its `.sha256` from
    pkgs.tailscale.com on the swamp host, and refuses on a mismatch.
@@ -112,7 +125,14 @@ With `apply: true` it:
    session stays up. Its log is `/userdata/tailscale-update.log`.
 4. Polls until the node reports the new version, `Running`, online, with the
    **same tailnet IP**, which proves it is the same machine with its state
-   intact.
+   intact. With `tailnetIp` it must also **answer over the tailnet** from the
+   swamp host (the anonymous probe `health` uses; with `hostKey` pinned, the
+   key on that address must actually be read and match). Once the device
+   reports itself back, the tailnet path gets 45 s of grace even past the
+   deadline, since peers need a moment to learn a restarted node's endpoints.
+   The device's own report is not enough: after a swap, a JetKVM has reported `Running` and online while
+   a peer's pings got no answer. The probe proves the path from wherever swamp
+   runs, not from every peer.
 5. If that does not happen within `rejoinTimeoutMs` (default 120 s), restores
    the backup, restarts the daemon, records `rolled-back` and fails. The
    restore ignores a dropped session and renames the binaries into place, so a
@@ -126,7 +146,7 @@ The `outcome` says what happened, and which ones need a human:
 | ------------------- | ------------------------------------------------------------------------- |
 | `done`              | Updated and rejoined (and, with `rebootAfter`, rejoined after a reboot)   |
 | `unchanged`         | The swap exited before swapping; the device is as it was                  |
-| `rolled-back`       | Swapped, did not rejoin, old binaries restored and running                |
+| `rolled-back`       | Swapped, did not rejoin (or did not answer over the tailnet), old binaries restored and running |
 | `rollback-failed`   | **Needs a human**: the restore did not bring the old version back up      |
 | `swap-unconfirmed`  | **Needs a human**: the swap was still running or unreadable at 2x timeout |
 | `reboot-unverified` | Updated, but the reboot check did not pass; the backup is still there     |
@@ -138,12 +158,38 @@ boot ID, and is skipped (`reboot-unverified`, no reboot) if it cannot be read
 first. The "same tailnet IP" check applies when the probe can read an IPv4
 tailnet address.
 
+Every `tailscale` record carries `tailnet`: the last tailnet probe (after the
+swap, the rollback or the reboot; before it for a refusal), or null without
+`tailnetIp`.
+
+**Pre-flight checks.** `tailscaleUpdate` runs five checks first, all labeled
+`live` and scoped to it alone (swamp runs an unscoped check before every
+method). The first three share one SSH probe.
+
+| Check                   | Fails when                                                        |
+| ----------------------- | ----------------------------------------------------------------- |
+| `tailscale-installed`   | Tailscale is missing or its version is unreadable                 |
+| `tailscale-boot-script` | `S22tailscale` is missing                                         |
+| `userdata-free-space`   | `/userdata` free space is unreadable or under 200 MB              |
+| `tailnet-path`          | With `tailnetIp`: the device does not answer over the tailnet now |
+| `swap-not-running`      | An earlier swap is still running on the device                    |
+
+A check that cannot probe the device fails rather than passes. The method
+enforces the same conditions itself, so `--skip-check-label live` only skips
+the early answer, never the guard. A refusal by a check leaves no `tailscale` record (checks cannot
+write data): the check's error is its only trace. `tailscale` action update
+records the same refusal as a plan. The downgrade refusal is not a check: it
+depends on the `version` argument, which checks only see unvalidated. For the
+same reason the checks are stricter than the method on a no-op: a device that
+is already current but low on space fails `userdata-free-space`, where the
+method alone would record `current`.
+
 Use the device's **LAN address** as `host`. The update restarts tailscaled, so
 an SSH session running over the tailnet would be cut.
 
 ```bash
-swamp model method run kvm-a tailscale --input action=update                  # dry run
-swamp model method run kvm-a tailscale --input action=update --input apply=true
+swamp model method run kvm-a tailscale --input action=update   # the plan; changes nothing
+swamp model method run kvm-a tailscaleUpdate                   # update to the current stable
 ```
 
 ## Setup

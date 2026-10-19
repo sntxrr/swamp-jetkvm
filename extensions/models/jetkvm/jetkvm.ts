@@ -26,10 +26,15 @@
  * system 0.2.7 on. `tailscale update` here keeps that layout: it backs up the
  * running binaries, swaps in the new ones, re-runs `configure jetkvm`, restarts
  * the daemon (no reboot), and rolls back by itself if the node does not rejoin
- * the tailnet with the same address.
+ * the tailnet with the same address. With `tailnetIp` set, "rejoined" also
+ * means the device answers over the tailnet from the swamp host: the device's
+ * own report can say Running and online while peers cannot reach it.
  *
- * Every method that changes the device defaults to a dry run; pass
- * `apply: true` to act.
+ * Reads and writes are separate methods. `health` and `tailscale` (status, or
+ * the plan for an update) never change the device; `tailscaleUpdate` always
+ * does, and its labeled `live` pre-flight checks run first. The same
+ * conditions are also enforced inside the method, so skipping the checks
+ * skips only the early answer, never the guard.
  *
  * @module
  */
@@ -690,6 +695,13 @@ const TailscaleStateSchema = z.object({
   dnsName: z.string().nullable(),
 });
 
+const TailnetProbeSchema = z.object({
+  ip: z.string(),
+  reachable: z.boolean(),
+  sameDevice: z.boolean().nullable(),
+  error: z.string().nullable(),
+});
+
 const HealthSchema = z.object({
   host: z.string(),
   checkedAt: z.string(),
@@ -714,12 +726,7 @@ const HealthSchema = z.object({
   developerMode: z.boolean().nullable(),
   tailscale: TailscaleStateSchema.nullable(),
   latestTailscale: z.string().nullable(),
-  tailnet: z.object({
-    ip: z.string(),
-    reachable: z.boolean(),
-    sameDevice: z.boolean().nullable(),
-    error: z.string().nullable(),
-  }).nullable().describe(
+  tailnet: TailnetProbeSchema.nullable().describe(
     "The anonymous probe of tailnetIp (/metrics and the SSH host key). Null when no tailnetIp is set. Recorded even when SSH on the LAN fails.",
   ),
   error: z.string().nullable(),
@@ -751,6 +758,9 @@ const TailscaleSchema = z.object({
   sha256: z.string().nullable(),
   before: TailscaleStateSchema,
   after: TailscaleStateSchema.nullable(),
+  tailnet: TailnetProbeSchema.nullable().default(null).describe(
+    "The last anonymous probe of tailnetIp from the swamp host: after the swap (or the rollback, or the reboot), or before it for a refusal. Null without tailnetIp, before 2026.10.19.1, or when the run never got that far.",
+  ),
   steps: z.array(z.string()).describe("What was (or would be) done, in order."),
 });
 
@@ -807,6 +817,197 @@ export async function latestFirmware(
     app: typeof j?.appVersion === "string" ? j.appVersion : null,
     system: typeof j?.systemVersion === "string" ? j.systemVersion : null,
   };
+}
+
+/**
+ * The anonymous tailnet probe: /metrics on `tailnetIp`, and with a pinned
+ * hostKey an ssh-keyscan there. Null when no tailnetIp is set; never throws.
+ *
+ * Anonymous, so a stale address that now belongs to another node learns
+ * nothing: /metrics needs no login and ssh-keyscan offers no key. Its
+ * transport is built from the address and timeouts only, so it cannot be used
+ * to log in. It proves the path from wherever swamp runs, not from every peer.
+ */
+export async function probeTailnet(
+  g: GlobalArgs,
+): Promise<TailnetProbe | null> {
+  if (!g.tailnetIp) return null;
+  const tt = transportFactory.create({
+    host: g.tailnetIp,
+    scheme: g.scheme,
+    sshUser: g.sshUser,
+    sshPort: g.sshPort,
+    timeoutMs: Math.min(g.timeoutMs, 10000),
+  });
+  try {
+    const r = await tt.device("/metrics");
+    const isJetkvm = r.status === 200 &&
+      parseMetrics(new TextDecoder().decode(r.body)).has("jetkvm_build_info");
+    let sameKey: boolean | null = null;
+    if (isJetkvm && g.hostKey) {
+      const seen = await tt.scanHostKey(g.hostKey.split(" ")[0])
+        .catch(() => null);
+      sameKey = seen === null ? null : seen === g.hostKey;
+    }
+    return {
+      ip: g.tailnetIp,
+      reachable: true,
+      sameDevice: isJetkvm ? sameKey : false,
+      error: !isJetkvm
+        ? `/metrics answered HTTP ${r.status} without jetkvm_build_info`
+        : sameKey === false
+        ? "a JetKVM answered, with a different SSH host key than the pinned one"
+        : null,
+    };
+  } catch (e) {
+    return {
+      ip: g.tailnetIp,
+      reachable: false,
+      sameDevice: null,
+      error: (e as Error).message,
+    };
+  }
+}
+
+/**
+ * Whether a tailnet probe counts as "this device answers over the tailnet".
+ * No probe (no tailnetIp) passes: there is nothing to check against. Pure.
+ */
+export function tailnetOk(p: TailnetProbe | null): boolean {
+  return p === null || (p.reachable && p.sameDevice !== false);
+}
+
+/**
+ * Stricter than tailnetOk, for the update: with a pinned hostKey the key on
+ * the tailnet address must have been READ and match. health tolerates an
+ * unreadable key (sameDevice null); an update must not count it as proof.
+ */
+export function tailnetVerified(
+  p: TailnetProbe | null,
+  hostKeyPinned: boolean,
+): boolean {
+  return tailnetOk(p) &&
+    !(hostKeyPinned && p !== null && p.sameDevice === null);
+}
+
+/** One-line account of a tailnet probe, for messages. Pure. */
+export function describeTailnet(p: TailnetProbe | null): string {
+  if (!p) return "no tailnetIp to probe";
+  if (!p.reachable) return `${p.ip} unreachable (${p.error ?? "no answer"})`;
+  if (p.sameDevice === false) return `${p.ip} is another device (${p.error})`;
+  if (p.sameDevice === null) {
+    return `${p.ip} answers, but its SSH host key could not be read`;
+  }
+  return `${p.ip} answers`;
+}
+
+/** Free space an update needs: tarball (~30 MB) + staged copy and backup (~65 MB each). */
+export const NEED_FREE_KB = 200 * 1024;
+
+/**
+ * The pre-flight checks each need the same device facts. They run back to
+ * back, so one probe serves them all; a short TTL keeps a later run from
+ * judging a stale reading. A failed probe is not cached. Exported for tests.
+ */
+export const checkProbeCache = {
+  ttlMs: 30000,
+  entries: new Map<string, { at: number; p: Promise<Probe> }>(),
+  clear() {
+    this.entries.clear();
+  },
+};
+
+/** Everything that decides which device a probe reaches and how it logs in. */
+function probeKey(g: GlobalArgs): string {
+  return JSON.stringify([
+    g.host,
+    g.sshPort,
+    g.sshUser,
+    g.sshKeyFile ?? null,
+    g.hostKey ?? null,
+  ]);
+}
+
+function forgetProbe(key: string, p: Promise<Probe>) {
+  // Only our own entry: a newer probe may have replaced it since.
+  if (checkProbeCache.entries.get(key)?.p === p) {
+    checkProbeCache.entries.delete(key);
+  }
+}
+
+function probeForChecks(g: GlobalArgs): { key: string; p: Promise<Probe> } {
+  const key = probeKey(g);
+  const hit = checkProbeCache.entries.get(key);
+  if (hit && Date.now() - hit.at < checkProbeCache.ttlMs) {
+    return { key, p: hit.p };
+  }
+  const p = probe(transportFactory.create(g));
+  checkProbeCache.entries.set(key, { at: Date.now(), p });
+  p.catch(() => forgetProbe(key, p));
+  return { key, p };
+}
+
+/** Run a device-state check: probe, judge, and fail closed when the probe fails. */
+async function deviceCheck(
+  rawGlobals: unknown,
+  judge: (p: Probe) => string | null,
+): Promise<{ pass: boolean; errors?: string[] }> {
+  let p: Probe;
+  let entry: { key: string; p: Promise<Probe> };
+  try {
+    entry = probeForChecks(GlobalArgsSchema.parse(rawGlobals));
+    p = await entry.p;
+  } catch (e) {
+    return {
+      pass: false,
+      errors: [`could not probe the device: ${(e as Error).message}`],
+    };
+  }
+  const why = judge(p);
+  // A failing reading is not kept: the operator fixes it and re-runs at once.
+  if (why) forgetProbe(entry.key, entry.p);
+  return why ? { pass: false, errors: [why] } : { pass: true };
+}
+
+/** Why an update must not start, judged from device facts; null when it may. Pure. */
+export function installRefusal(p: Probe): string | null {
+  const ts = p.tailscale;
+  if (!ts.installed || !ts.version || !TS_VERSION.test(ts.version)) {
+    return "Tailscale is not installed (or its version is unreadable); install it with JetKVM's install-tailscale.sh first";
+  }
+  return null;
+}
+
+/** See installRefusal. */
+export function bootScriptRefusal(p: Probe): string | null {
+  return p.tailscale.bootScript
+    ? null
+    : `${TS_BOOT} is missing: this is not the layout \`tailscale configure jetkvm\` produces, so a swap could leave it unstartable`;
+}
+
+/** See installRefusal. */
+export function freeSpaceRefusal(p: Probe): string | null {
+  if (p.diskFreeKb === null) {
+    return "could not read free space on /userdata, so the update cannot check it fits";
+  }
+  if (p.diskFreeKb < NEED_FREE_KB) {
+    return `/userdata has ${Math.round(p.diskFreeKb / 1024)} MB free; ${
+      NEED_FREE_KB / 1024
+    } MB needed`;
+  }
+  return null;
+}
+
+/** See installRefusal: an update the swamp host could not verify must not start. */
+export function tailnetRefusal(
+  t: TailnetProbe | null,
+  hostKeyPinned: boolean,
+): string | null {
+  return tailnetVerified(t, hostKeyPinned)
+    ? null
+    : `the tailnet path from this host is already broken (${
+      describeTailnet(t)
+    }), so a swap could not be verified and would roll back; fix that first`;
 }
 
 /** Files the detached swap leaves on the device. The log is kept for diagnosis. */
@@ -951,6 +1152,17 @@ export function parseSwapState(stdout: string | null): SwapState {
   };
 }
 
+/** Why an update must not start given the device's swap state; null when it may. Pure. */
+export function swapRunningRefusal(st: SwapState): string | null {
+  if (st.state === "running" || st.state === "starting") {
+    return `a Tailscale swap is already ${st.state} on the device (see ${SWAP_LOG}); wait for it to finish before starting another`;
+  }
+  if (st.state === "unknown") {
+    return "could not read whether a Tailscale swap is already running on the device";
+  }
+  return null;
+}
+
 async function swapState(t: Transport): Promise<SwapState> {
   const r = await t.ssh("sh -s", new TextEncoder().encode(SWAP_STATE_SCRIPT))
     .catch(() => null);
@@ -959,6 +1171,12 @@ async function swapState(t: Transport): Promise<SwapState> {
 
 /** Polling cadence for the rejoin check. Exported so tests can shorten it. */
 export const rejoinPoll = { intervalMs: 3000 };
+
+/**
+ * How long a device that reports itself rejoined has to also answer over the
+ * tailnet before the update is judged failed. Exported so tests can shorten it.
+ */
+export const tailnetGrace = { ms: 45000 };
 
 interface Ctx {
   globalArgs: GlobalArgs;
@@ -973,6 +1191,531 @@ interface Ctx {
   };
 }
 
+/** Arguments shared by `tailscale` (plan) and `tailscaleUpdate` (act). */
+const UpdateArgsShape = {
+  version: z.string().regex(TS_VERSION).optional().describe(
+    "Target version (e.g. 1.104.1). Default: the current stable from pkgs.tailscale.com.",
+  ),
+  allowDowngrade: z.boolean().default(false),
+  rejoinTimeoutMs: z.number().int().positive().default(120000).describe(
+    "How long to wait for the node to rejoin (and, with tailnetIp, answer over the tailnet from the swamp host) before rolling back.",
+  ),
+  transferTimeoutMs: z.number().int().positive().default(600000),
+  rebootAfter: z.boolean().default(false).describe(
+    "After a verified update, reboot the KVM and wait for it to rejoin again: proves the new version starts from the boot script. The target machine is not affected; the KVM's own session drops for the reboot.",
+  ),
+  rebootTimeoutMs: z.number().int().positive().default(300000).describe(
+    "How long to wait for the KVM to come back from rebootAfter.",
+  ),
+};
+
+interface TailscaleRunArgs {
+  action: "status" | "update";
+  version?: string;
+  allowDowngrade: boolean;
+  rejoinTimeoutMs: number;
+  rebootAfter: boolean;
+  rebootTimeoutMs: number;
+  transferTimeoutMs: number;
+  apply: boolean;
+}
+
+/** The body of `tailscale` and `tailscaleUpdate`; only the latter passes apply. */
+async function runTailscale(
+  args: TailscaleRunArgs,
+  context: Ctx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = context.globalArgs;
+  const t = transportFactory.create(g);
+  context.logger.info("JetKVM {host}: tailscale {action}{mode}", {
+    host: g.host,
+    action: args.action,
+    mode: args.action === "update"
+      ? (args.apply ? " (apply)" : " (dry run)")
+      : "",
+  });
+  const before = await probe(t);
+  const ts = before.tailscale;
+  const latest = await latestTailscale(t).catch((e) => {
+    context.logger.warn("Tailscale release check failed: {msg}", {
+      msg: (e as Error).message,
+    });
+    return null;
+  });
+  const target = args.version ?? latest;
+  const steps: string[] = [];
+  // Every record carries the most recent tailnet probe, so a rollback or a
+  // refusal shows what the swamp host could (not) reach.
+  let lastTailnet: TailnetProbe | null = null;
+  const record = (rec: {
+    applied: boolean;
+    outcome: z.infer<typeof TailscaleSchema>["outcome"];
+    message: string;
+    after?: Probe["tailscale"] | null;
+    sha256?: string | null;
+  }) => {
+    context.logger.info("JetKVM {host}: tailscale {outcome}: {message}", {
+      host: g.host,
+      outcome: rec.outcome,
+      message: rec.message,
+    });
+    return context.writeResource("tailscale", "tailscale", {
+      host: g.host,
+      at: new Date().toISOString(),
+      action: args.action,
+      fromVersion: ts.version,
+      targetVersion: target,
+      latestVersion: latest,
+      before: ts,
+      steps,
+      ...rec,
+      after: rec.after ?? null,
+      sha256: rec.sha256 ?? null,
+      tailnet: lastTailnet,
+    });
+  };
+  const refuse = async (why: string): Promise<never> => {
+    await record({ applied: false, outcome: "refused", message: why });
+    throw new Error(`tailscale ${args.action} on ${g.host}: ${why}`);
+  };
+
+  if (args.action === "status") {
+    const h = await record({
+      applied: false,
+      outcome: "status",
+      message: ts.installed
+        ? `Tailscale ${ts.version ?? "?"} (${ts.backendState ?? "unknown"}${
+          ts.online === null ? "" : ts.online ? ", online" : ", offline"
+        })` +
+          (latest && ts.version && compareVersions(latest, ts.version) > 0
+            ? `; ${latest} is available`
+            : "")
+        : "Tailscale is not installed",
+    });
+    return { dataHandles: [h] };
+  }
+
+  // The same judgements as the pre-flight checks; repeated here so that
+  // skipping the checks never skips the guard.
+  for (const why of [installRefusal(before), bootScriptRefusal(before)]) {
+    if (why) await refuse(why);
+  }
+  if (!target) {
+    await refuse(
+      "no target version: pass `version`, or let pkgs.tailscale.com be reached",
+    );
+  }
+  const cmp = compareVersions(target!, ts.version!);
+  if (cmp === 0) {
+    const h = await record({
+      applied: false,
+      outcome: "current",
+      message: `already on ${target}`,
+    });
+    return { dataHandles: [h] };
+  }
+  if (cmp < 0 && !args.allowDowngrade) {
+    await refuse(
+      `${target} is older than the installed ${ts.version}; pass allowDowngrade: true to go back`,
+    );
+  }
+  const space = freeSpaceRefusal(before);
+  if (space) await refuse(space);
+  // A path that is already broken would make a good update look failed and
+  // roll it back; say so up front instead.
+  lastTailnet = await probeTailnet(g);
+  const path = tailnetRefusal(lastTailnet, Boolean(g.hostKey));
+  if (path) await refuse(path);
+  const prior = swapRunningRefusal(await swapState(t));
+  if (prior) await refuse(prior);
+
+  const tarball = `tailscale_${target}_arm.tgz`;
+  const url = `https://pkgs.tailscale.com/stable/${tarball}`;
+  steps.push(
+    `download ${url} on the swamp host and check it against ${url}.sha256`,
+    `stream it over SSH to /userdata/tailscale-${target}.tgz and re-check its sha256 on the device`,
+    `back up ${TS_DIR}/tailscale{,d} to ${TS_DIR}/backup-${ts.version}/`,
+    `stop tailscaled, swap in ${target}, run \`tailscale configure jetkvm\`, start it via ${TS_BOOT} (no reboot)`,
+    `wait up to ${
+      args.rejoinTimeoutMs / 1000
+    }s for ${target}, Running, online, tailnet IP ${ts.ip ?? "(unknown)"}${
+      g.tailnetIp
+        ? `, and answering anonymously on ${g.tailnetIp} from this host`
+        : ""
+    }; otherwise restore the backup`,
+  );
+  if (args.rebootAfter) {
+    steps.push(
+      `reboot the KVM and wait up to ${
+        args.rebootTimeoutMs / 1000
+      }s for it to come back the same way (no automatic rollback after this point; the backup stays)`,
+    );
+  }
+  if (!args.apply) {
+    const h = await record({
+      applied: false,
+      outcome: "dry-run",
+      message:
+        `would update ${ts.version} → ${target}; call tailscaleUpdate to act`,
+    });
+    return { dataHandles: [h] };
+  }
+
+  // 1. Download and verify on the swamp host, with real TLS.
+  const [tgz, sum] = await Promise.all([
+    t.fetch(url, args.transferTimeoutMs),
+    t.fetch(`${url}.sha256`),
+  ]);
+  if (tgz.status !== 200 || sum.status !== 200) {
+    await refuse(
+      `download failed: ${tarball} HTTP ${tgz.status}, .sha256 HTTP ${sum.status}`,
+    );
+  }
+  const want = new TextDecoder().decode(sum.body).trim().split(/\s+/)[0];
+  const got = await sha256Hex(tgz.body);
+  if (!/^[0-9a-f]{64}$/.test(want) || got !== want) {
+    await refuse(
+      `sha256 mismatch for ${tarball}: got ${got}, expected ${want}`,
+    );
+  }
+
+  // 2. Upload and re-verify on the device.
+  context.logger.info("Tailscale update on {host}: {from} → {to}", {
+    host: g.host,
+    from: ts.version,
+    to: target,
+  });
+  const remoteTgz = `/userdata/tailscale-${target}.tgz`;
+  const cleanUp = () =>
+    t.ssh(`rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS}`)
+      .catch(() => null);
+  const up = await t.ssh(
+    `cat > ${remoteTgz} && sha256sum ${remoteTgz}`,
+    tgz.body,
+    args.transferTimeoutMs,
+  );
+  if (up.code !== 0 || up.stdout.trim().split(/\s+/)[0] !== got) {
+    await cleanUp();
+    await refuse(
+      `upload did not verify on the device (exit ${up.code}): ${up.stderr.trim()}`,
+    );
+  }
+
+  // 3. Swap, detached so a dropped session cannot strand it half-done.
+  // Writing the script and launching it are two sessions on purpose: in
+  // `cat > f && nohup sh f &` the `&` backgrounds the whole list, and sh
+  // gives a background job /dev/null as stdin, so cat writes an empty
+  // file and nothing runs (seen live). The byte count proves it landed.
+  const script = new TextEncoder().encode(
+    swapScript(target!, ts.version!),
+  );
+  const wrote = await t.ssh(
+    `rm -f ${SWAP_PID} ${SWAP_STATUS} ${SWAP_LOG} && cat > ${SWAP_SH} && wc -c < ${SWAP_SH}`,
+    script,
+  );
+  if (wrote.code !== 0 || Number(wrote.stdout.trim()) !== script.length) {
+    await cleanUp();
+    await refuse(
+      `the swap script did not land on the device (exit ${wrote.code}, ${
+        wrote.stdout.trim() || 0
+      } of ${script.length} bytes): ${wrote.stderr.trim()}`,
+    );
+  }
+  const swap = await t.ssh(
+    `nohup sh ${SWAP_SH} > ${SWAP_LOG} 2>&1 < /dev/null &`,
+  ).catch((e) => ({
+    code: -1,
+    stdout: "",
+    stderr: (e as Error).message,
+  }));
+  if (swap.code !== 0) {
+    // The session can drop after the job started; only a device that
+    // shows no trace of the script counts as "never started".
+    const st = await swapState(t);
+    if (st.state === "none") {
+      await cleanUp();
+      await refuse(
+        `could not start the swap (exit ${swap.code}): ${swap.stderr.trim()}`,
+      );
+    }
+    context.logger.warn(
+      "swap launch on {host} returned exit {code}, but the device shows it {state}; watching it",
+      { host: g.host, code: swap.code, state: st.state },
+    );
+  }
+
+  // 4. Wait for the node to come back as the same machine. Past the
+  // deadline, keep waiting while the script is still running (a slow tar
+  // on armv7), up to twice the timeout: deciding while it runs would
+  // race it.
+  const rejoined = (p: Probe["tailscale"]) =>
+    p.version === target && p.daemonRunning &&
+    p.backendState === "Running" && p.online === true &&
+    (ts.ip === null || p.ip === ts.ip);
+  // The device's own report is not enough: on 2026-10-19 a swapped JetKVM said
+  // Running and online while a peer's pings got no answer. With tailnetIp, it
+  // must also answer over the tailnet from here. Probed only once the device
+  // reports rejoined, so a dead path costs one capped timeout per round.
+  const confirmed = async (p: Probe["tailscale"] | null) => {
+    if (!p || !rejoined(p)) return false;
+    lastTailnet = await probeTailnet(g);
+    return tailnetVerified(lastTailnet, Boolean(g.hostKey));
+  };
+  // From here on a record must not carry the pre-swap probe: it would say
+  // "reachable" about a device that may now be down.
+  lastTailnet = null;
+  const freshTailnet = async () => {
+    if (g.tailnetIp) lastTailnet = await probeTailnet(g);
+  };
+  let after: Probe["tailscale"] | null = null;
+  let ok = false;
+  let st: SwapState = { state: "unknown", exitCode: null, log: "" };
+  // When the device first reported itself rejoined. From then the tailnet
+  // path gets tailnetGrace to answer: right after tailscaled restarts, peers
+  // do not yet have its new endpoints, and a good update must not be rolled
+  // back for that.
+  let rejoinedAt: number | null = null;
+  let lookedAgain = false;
+  const started = Date.now();
+  while (true) {
+    await sleep(rejoinPoll.intervalMs);
+    after = await probe(t).then((p) => p.tailscale).catch(() => after);
+    if (after && rejoined(after)) {
+      rejoinedAt ??= Date.now();
+      if ((ok = await confirmed(after))) break;
+    }
+    const now = Date.now();
+    const elapsed = now - started;
+    if (elapsed < args.rejoinTimeoutMs) continue;
+    if (rejoinedAt !== null) {
+      if (now < rejoinedAt + tailnetGrace.ms) continue;
+      st = await swapState(t);
+      break;
+    }
+    st = await swapState(t);
+    // The state check runs after this round's probe, so a swap seen to exit
+    // just now was judged on the probe from before it finished: go round
+    // once more (and into the grace, if it rejoined) before deciding.
+    if (st.state === "exited" && !lookedAgain) {
+      lookedAgain = true;
+      continue;
+    }
+    const live = st.state === "running" || st.state === "starting";
+    if (!live || elapsed >= 2 * args.rejoinTimeoutMs) {
+      break;
+    }
+  }
+
+  if (ok && after) {
+    // Each update leaves a ~65 MB backup. Once the new version is proven,
+    // keep only the one this update replaced: it is the rollback source.
+    const keep = `${TS_DIR}/backup-${ts.version}`;
+    const pruned = await t.ssh(pruneBackupsScript(ts.version!)).catch(
+      (e) => ({ code: -1, stdout: "", stderr: (e as Error).message }),
+    );
+    if (pruned.code !== 0) {
+      context.logger.warn(
+        "could not prune old Tailscale backups on {host}: {msg}",
+        { host: g.host, msg: pruned.stderr.trim() },
+      );
+    }
+    const done =
+      `updated ${ts.version} → ${target}; Running, online, ${after.ip}${
+        g.tailnetIp
+          ? `; tailnet from this host: ${describeTailnet(lastTailnet)}`
+          : ""
+      }. Backup kept in ${keep}/`;
+    if (!args.rebootAfter) {
+      const h = await record({
+        applied: true,
+        outcome: "done",
+        message: done,
+        after,
+        sha256: got,
+      });
+      return { dataHandles: [h] };
+    }
+
+    // 4b. Prove it also starts from the boot script. A reboot is seen as
+    // a new kernel boot id; without one to compare, do not reboot.
+    const unverified = async (why: string, last: Probe | null) => {
+      await freshTailnet();
+      await record({
+        applied: true,
+        outcome: "reboot-unverified",
+        message:
+          `${done}. But ${why}. Restore by hand from ${TS_DIR}/backup-${ts.version}/ if needed`,
+        after: last?.tailscale ?? after,
+        sha256: got,
+      });
+      throw new Error(
+        `Tailscale on ${g.host}: update applied, but ${why}`,
+      );
+    };
+    const pre = await probe(t).catch(() => null);
+    if (!pre?.bootId) {
+      await unverified(
+        "the boot id could not be read before rebooting, so the KVM was not rebooted",
+        pre,
+      );
+    }
+    context.logger.info(
+      "rebooting {host} to verify Tailscale starts at boot",
+      { host: g.host },
+    );
+    const rb = await t.ssh("(sleep 1; reboot) >/dev/null 2>&1 &").catch((
+      e,
+    ) => ({ code: -1, stdout: "", stderr: (e as Error).message }));
+    if (rb.code !== 0) {
+      await unverified(
+        `the reboot command failed (exit ${rb.code}): ${rb.stderr.trim()}`,
+        pre,
+      );
+    }
+    let booted: Probe | null = null;
+    let sawReboot = false;
+    let bootOk = false;
+    const bootDeadline = Date.now() + args.rebootTimeoutMs;
+    while (Date.now() < bootDeadline) {
+      await sleep(rejoinPoll.intervalMs);
+      const p = await probe(t).catch(() => null);
+      if (!p) continue;
+      booted = p;
+      sawReboot = p.bootId !== null && p.bootId !== pre!.bootId;
+      if (sawReboot && (bootOk = await confirmed(p.tailscale))) break;
+    }
+    if (booted && sawReboot && bootOk) {
+      const msg =
+        `${done}. Rebooted: back after boot with ${booted.tailscale.version}, Running, online, ${booted.tailscale.ip} (uptime ${booted.uptimeSeconds}s)`;
+      const h = await record({
+        applied: true,
+        outcome: "done",
+        message: msg,
+        after: booted.tailscale,
+        sha256: got,
+      });
+      return { dataHandles: [h] };
+    }
+    await unverified(
+      (!booted
+        ? "the KVM did not answer SSH after the reboot"
+        : !sawReboot
+        ? "the KVM never showed a reboot (boot id unchanged)"
+        : `after the reboot Tailscale is ${booted.tailscale.version}, ${booted.tailscale.backendState}, online=${booted.tailscale.online}, ip=${booted.tailscale.ip}${
+          // lastTailnet is from after the reboot only if the device rejoined.
+          g.tailnetIp && rejoined(booted.tailscale)
+            ? `, tailnet: ${describeTailnet(lastTailnet)}`
+            : ""}`) +
+        ` within ${args.rebootTimeoutMs / 1000}s`,
+      booted,
+    );
+  }
+
+  // A device that reports itself rejoined failed only on the tailnet probe:
+  // name it, or the message reads as if nothing was wrong.
+  // Every record from here on is a failure: give it the path as it is now.
+  await freshTailnet();
+  const last = after
+    ? `${after.version}, ${after.backendState}, online=${after.online}, ip=${after.ip}${
+      g.tailnetIp && rejoined(after)
+        ? `, but tailnet from this host: ${describeTailnet(lastTailnet)}`
+        : ""
+    }`
+    : "no probe";
+  const logText = st.log || "(empty)";
+
+  // 5a. The script is still running, or the device cannot say: rolling
+  // back now would race it. Leave it to a human, with what is known.
+  if (
+    st.state === "running" || st.state === "starting" ||
+    st.state === "unknown"
+  ) {
+    await record({
+      applied: true,
+      outcome: "swap-unconfirmed",
+      message: `the swap is ${st.state} after ${
+        2 * args.rejoinTimeoutMs / 1000
+      }s (last: ${last}); not rolling back while it may still act. Check ${SWAP_LOG} and ${SWAP_STATUS}; backup in ${TS_DIR}/backup-${ts.version}/`,
+      after,
+      sha256: got,
+    });
+    throw new Error(
+      `Tailscale update on ${g.host} is unconfirmed (swap ${st.state}); swap log:\n${logText}`,
+    );
+  }
+
+  // 5b. The script finished without swapping: the device is unchanged.
+  if (!st.log.includes("binaries swapped")) {
+    await record({
+      applied: false,
+      outcome: "unchanged",
+      message: `the swap exited (${st.state}${
+        st.exitCode === null ? "" : ` ${st.exitCode}`
+      }) before swapping; the device is unchanged on ${ts.version} (${last}). Swap log: ${logText}`,
+      after,
+      sha256: got,
+    });
+    throw new Error(
+      `Tailscale update on ${g.host} did not take effect; device unchanged. Swap log:\n${logText}`,
+    );
+  }
+
+  // 5c. It was swapped and did not come back: restore the old binaries.
+  context.logger.warn(
+    "Tailscale on {host} did not rejoin as {to}; rolling back. Swap log: {log}",
+    { host: g.host, to: target, log: logText },
+  );
+  // The script can wait 20 s for the daemon to stop before it copies:
+  // the default per-command timeout would kill it mid-restore.
+  const rbk = await t.ssh(
+    "sh -s",
+    new TextEncoder().encode(rollbackScript(ts.version!)),
+    Math.max(g.timeoutMs, 60000) + 30000,
+  ).catch((e) => ({
+    code: -1,
+    stdout: "",
+    stderr: (e as Error).message,
+  }));
+  let restored: Probe["tailscale"] | null = null;
+  const rbDeadline = Date.now() + args.rejoinTimeoutMs;
+  while (Date.now() < rbDeadline) {
+    await sleep(rejoinPoll.intervalMs);
+    restored = await probe(t).then((p) => p.tailscale).catch(() => null);
+    if (
+      restored?.version === ts.version && restored.daemonRunning &&
+      restored.backendState === "Running"
+    ) break;
+  }
+  const restoredOk = rbk.code === 0 && restored?.version === ts.version &&
+    restored.daemonRunning && restored.backendState === "Running";
+  // Recorded, not judged: the old version is what worked before, and whether
+  // its path came back says whether the new version was really the cause.
+  await freshTailnet();
+  await record({
+    applied: true,
+    outcome: restoredOk ? "rolled-back" : "rollback-failed",
+    message:
+      `${target} did not rejoin (last: ${last}); rollback exit ${rbk.code}${
+        rbk.code === 0 ? "" : ` (${rbk.stderr.trim() || rbk.stdout.trim()})`
+      }, now ${restored?.version ?? "unknown"} ${restored?.backendState ?? ""}${
+        restoredOk && g.tailnetIp
+          ? `, tailnet from this host: ${describeTailnet(lastTailnet)}`
+          : ""
+      }${
+        restoredOk
+          ? ""
+          : `. NEEDS A HUMAN: restore from ${TS_DIR}/backup-${ts.version}/`
+      }`,
+    after: restored,
+    sha256: got,
+  });
+  throw new Error(
+    `Tailscale update on ${g.host} ${
+      restoredOk ? "rolled back" : "failed AND its rollback failed"
+    }; swap log:\n${logText}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -980,7 +1723,7 @@ interface Ctx {
 /** The `@sntxrr/jetkvm` model: health and Tailscale updates for one JetKVM. */
 export const model = {
   type: "@sntxrr/jetkvm",
-  version: "2026.10.18.2",
+  version: "2026.10.19.1",
   globalArguments: GlobalArgsSchema,
 
   upgrades: [
@@ -996,7 +1739,76 @@ export const model = {
         "No argument change. Review fixes: the tailnet probe runs before SSH and proves identity (jetkvm_build_info and the pinned host key, read anonymously); the rollback has a budget that covers its own stop wait and survives a dropped session; old backups are pruned after a verified update.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.10.19.1",
+      description:
+        "No global-argument change. BREAKING for callers: updates moved to the new tailscaleUpdate method, behind labeled live pre-flight checks; tailscale is read-only and refuses apply: true. With tailnetIp, an update counts as rejoined only when the device also answers over the tailnet from the swamp host, and it refuses to start when that path is already broken. tailscale records gain a tailnet field (null on older records).",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
+
+  // Scoped with appliesTo: swamp runs an unscoped check before EVERY method
+  // (measured on swamp 20261017), which would put SSH probes in front of
+  // health and the read-only tailscale. The method repeats each guard, so
+  // --skip-check-label live skips the early answer, never the protection.
+  checks: {
+    "tailscale-installed": {
+      description:
+        "Tailscale is installed in /userdata/tailscale and reports a version.",
+      labels: ["live"],
+      appliesTo: ["tailscaleUpdate"],
+      execute: (context: { globalArgs: unknown }) =>
+        deviceCheck(context.globalArgs, installRefusal),
+    },
+    "tailscale-boot-script": {
+      description:
+        "The boot script `tailscale configure jetkvm` writes exists, so a swapped daemon can be started.",
+      labels: ["live"],
+      appliesTo: ["tailscaleUpdate"],
+      execute: (context: { globalArgs: unknown }) =>
+        deviceCheck(context.globalArgs, bootScriptRefusal),
+    },
+    "userdata-free-space": {
+      description:
+        "/userdata has room for the tarball, the staged binaries and a backup (200 MB).",
+      labels: ["live"],
+      appliesTo: ["tailscaleUpdate"],
+      execute: (context: { globalArgs: unknown }) =>
+        deviceCheck(context.globalArgs, freeSpaceRefusal),
+    },
+    "tailnet-path": {
+      description:
+        "With tailnetIp, the device already answers over the tailnet from this host; otherwise the update could not be verified. Passes when no tailnetIp is set.",
+      labels: ["live"],
+      appliesTo: ["tailscaleUpdate"],
+      execute: async (context: { globalArgs: unknown }) => {
+        let why: string | null;
+        try {
+          const g = GlobalArgsSchema.parse(context.globalArgs);
+          why = tailnetRefusal(await probeTailnet(g), Boolean(g.hostKey));
+        } catch (e) {
+          why = `could not probe the tailnet path: ${(e as Error).message}`;
+        }
+        return why ? { pass: false, errors: [why] } : { pass: true };
+      },
+    },
+    "swap-not-running": {
+      description:
+        "No earlier Tailscale swap is still running on the device; two would race on the same staging and backup paths.",
+      labels: ["live"],
+      appliesTo: ["tailscaleUpdate"],
+      execute: async (context: { globalArgs: unknown }) => {
+        let why: string | null;
+        try {
+          const g = GlobalArgsSchema.parse(context.globalArgs);
+          why = swapRunningRefusal(await swapState(transportFactory.create(g)));
+        } catch (e) {
+          why = `could not read the swap state: ${(e as Error).message}`;
+        }
+        return why ? { pass: false, errors: [why] } : { pass: true };
+      },
+    },
+  },
 
   resources: {
     health: {
@@ -1042,7 +1854,6 @@ export const model = {
         const t = transportFactory.create(g);
         const checkedAt = new Date();
         context.logger.info("JetKVM {host}: checking health", { host: g.host });
-        context.logger.info("JetKVM {host}: health check", { host: g.host });
         const blank = {
           host: g.host,
           checkedAt: checkedAt.toISOString(),
@@ -1080,49 +1891,9 @@ export const model = {
 
         // The tailnet probe does not depend on SSH, so it runs first and is
         // recorded on every path: with the LAN down it is what tells "device
-        // dead" from "LAN broken". It is anonymous, so a stale address that now
-        // belongs to another node learns nothing: /metrics needs no login, and
-        // ssh-keyscan offers no key. Its transport is built from the address
-        // and timeouts only, so it cannot be used to log in.
-        let tailnet: TailnetProbe | null = null;
-        if (g.tailnetIp) {
-          const tt = transportFactory.create({
-            host: g.tailnetIp,
-            scheme: g.scheme,
-            sshUser: g.sshUser,
-            sshPort: g.sshPort,
-            timeoutMs: Math.min(g.timeoutMs, 10000),
-          });
-          try {
-            const r = await tt.device("/metrics");
-            const isJetkvm = r.status === 200 &&
-              parseMetrics(new TextDecoder().decode(r.body)).has(
-                "jetkvm_build_info",
-              );
-            let sameKey: boolean | null = null;
-            if (isJetkvm && g.hostKey) {
-              const seen = await tt.scanHostKey(g.hostKey.split(" ")[0])
-                .catch(() => null);
-              sameKey = seen === null ? null : seen === g.hostKey;
-            }
-            tailnet = {
-              ip: g.tailnetIp,
-              reachable: true,
-              sameDevice: isJetkvm ? sameKey : false,
-              error: !isJetkvm
-                ? `/metrics answered HTTP ${r.status} without jetkvm_build_info`
-                : sameKey === false
-                ? "a JetKVM answered, with a different SSH host key than the pinned one"
-                : null,
-            };
-          } catch (e) {
-            tailnet = {
-              ip: g.tailnetIp,
-              reachable: false,
-              sameDevice: null,
-              error: (e as Error).message,
-            };
-          }
+        // dead" from "LAN broken". See probeTailnet for why it is anonymous.
+        const tailnet = await probeTailnet(g);
+        if (tailnet) {
           context.logger.info(
             "JetKVM {host}: tailnet {ip} reachable={reachable} sameDevice={same}",
             {
@@ -1248,479 +2019,39 @@ export const model = {
 
     tailscale: {
       description:
-        "Report Tailscale on the JetKVM, or update it. The device has no CA store, so `tailscale update` cannot run there: this method downloads the official arm tarball on the swamp host, checks its sha256, streams it over SSH, backs up the running binaries, swaps them, re-runs `tailscale configure jetkvm` and restarts tailscaled without a reboot. It then waits for the node to be Running and online with the same tailnet IP, and restores the backup by itself if it is not. Dry run unless apply is true.",
+        "Read-only: report Tailscale on the JetKVM (action status), or plan an update (action update) and record every step it would take, including any refusal. Never changes the device. To update, call tailscaleUpdate. Since 2026.10.19.1 `apply: true` is refused here rather than ignored, so a caller written for the old method fails loudly instead of silently becoming a dry run.",
       arguments: z.object({
         action: z.enum(["status", "update"]).default("status"),
-        version: z.string().regex(TS_VERSION).optional().describe(
-          "Target version (e.g. 1.104.1). Default: the current stable from pkgs.tailscale.com.",
-        ),
-        allowDowngrade: z.boolean().default(false),
-        rejoinTimeoutMs: z.number().int().positive().default(120000).describe(
-          "How long to wait for the node to rejoin before rolling back.",
-        ),
-        transferTimeoutMs: z.number().int().positive().default(600000),
-        rebootAfter: z.boolean().default(false).describe(
-          "After a verified update, reboot the KVM and wait for it to rejoin again: proves the new version starts from the boot script. The target machine is not affected; the KVM's own session drops for the reboot.",
-        ),
-        rebootTimeoutMs: z.number().int().positive().default(300000).describe(
-          "How long to wait for the KVM to come back from rebootAfter.",
-        ),
+        ...UpdateArgsShape,
         apply: z.boolean().default(false).describe(
-          "Actually update. Without it, report what would happen.",
+          "Removed in 2026.10.19.1: true is refused. Use tailscaleUpdate.",
         ),
       }),
       execute: async (
-        args: {
-          action: "status" | "update";
-          version?: string;
-          allowDowngrade: boolean;
-          rejoinTimeoutMs: number;
-          rebootAfter: boolean;
-          rebootTimeoutMs: number;
-          transferTimeoutMs: number;
-          apply: boolean;
-        },
+        args: Omit<TailscaleRunArgs, "apply"> & { apply: boolean },
         context: Ctx,
       ): Promise<{ dataHandles: unknown[] }> => {
-        const g = context.globalArgs;
-        const t = transportFactory.create(g);
-        context.logger.info("JetKVM {host}: tailscale {action}{mode}", {
-          host: g.host,
-          action: args.action,
-          mode: args.action === "update"
-            ? (args.apply ? " (apply)" : " (dry run)")
-            : "",
-        });
-        const before = await probe(t);
-        const ts = before.tailscale;
-        const latest = await latestTailscale(t).catch((e) => {
-          context.logger.warn("Tailscale release check failed: {msg}", {
-            msg: (e as Error).message,
-          });
-          return null;
-        });
-        const target = args.version ?? latest;
-        const steps: string[] = [];
-        const record = (rec: {
-          applied: boolean;
-          outcome: z.infer<typeof TailscaleSchema>["outcome"];
-          message: string;
-          after?: Probe["tailscale"] | null;
-          sha256?: string | null;
-        }) =>
-          context.writeResource("tailscale", "tailscale", {
-            host: g.host,
-            at: new Date().toISOString(),
-            action: args.action,
-            fromVersion: ts.version,
-            targetVersion: target,
-            latestVersion: latest,
-            before: ts,
-            steps,
-            ...rec,
-            after: rec.after ?? null,
-            sha256: rec.sha256 ?? null,
-          });
-        const refuse = async (why: string): Promise<never> => {
-          await record({ applied: false, outcome: "refused", message: why });
-          throw new Error(`tailscale ${args.action} on ${g.host}: ${why}`);
-        };
-
-        if (args.action === "status") {
-          const h = await record({
-            applied: false,
-            outcome: "status",
-            message: ts.installed
-              ? `Tailscale ${ts.version ?? "?"} (${
-                ts.backendState ?? "unknown"
-              }${
-                ts.online === null ? "" : ts.online ? ", online" : ", offline"
-              })` +
-                (latest && ts.version && compareVersions(latest, ts.version) > 0
-                  ? `; ${latest} is available`
-                  : "")
-              : "Tailscale is not installed",
-          });
-          return { dataHandles: [h] };
-        }
-
-        if (!ts.installed || !ts.version || !TS_VERSION.test(ts.version)) {
-          await refuse(
-            "Tailscale is not installed (or its version is unreadable); install it with JetKVM's install-tailscale.sh first",
-          );
-        }
-        if (!ts.bootScript) {
-          await refuse(
-            `${TS_BOOT} is missing: this is not the layout \`tailscale configure jetkvm\` produces, so a swap could leave it unstartable`,
-          );
-        }
-        if (!target) {
-          await refuse(
-            "no target version: pass `version`, or let pkgs.tailscale.com be reached",
-          );
-        }
-        const cmp = compareVersions(target!, ts.version!);
-        if (cmp === 0) {
-          const h = await record({
-            applied: false,
-            outcome: "current",
-            message: `already on ${target}`,
-          });
-          return { dataHandles: [h] };
-        }
-        if (cmp < 0 && !args.allowDowngrade) {
-          await refuse(
-            `${target} is older than the installed ${ts.version}; pass allowDowngrade: true to go back`,
-          );
-        }
-        // Tarball (~30 MB) + staged copy (~65 MB) + backup (~65 MB).
-        const needKb = 200 * 1024;
-        if (before.diskFreeKb === null) {
-          await refuse(
-            "could not read free space on /userdata, so the update cannot check it fits",
-          );
-        }
-        if (before.diskFreeKb! < needKb) {
-          await refuse(
-            `/userdata has ${Math.round(before.diskFreeKb! / 1024)} MB free; ${
-              needKb / 1024
-            } MB needed`,
-          );
-        }
-
-        const tarball = `tailscale_${target}_arm.tgz`;
-        const url = `https://pkgs.tailscale.com/stable/${tarball}`;
-        steps.push(
-          `download ${url} on the swamp host and check it against ${url}.sha256`,
-          `stream it over SSH to /userdata/tailscale-${target}.tgz and re-check its sha256 on the device`,
-          `back up ${TS_DIR}/tailscale{,d} to ${TS_DIR}/backup-${ts.version}/`,
-          `stop tailscaled, swap in ${target}, run \`tailscale configure jetkvm\`, start it via ${TS_BOOT} (no reboot)`,
-          `wait up to ${
-            args.rejoinTimeoutMs / 1000
-          }s for ${target}, Running, online, tailnet IP ${
-            ts.ip ?? "(unknown)"
-          }; otherwise restore the backup`,
-        );
-        if (args.rebootAfter) {
-          steps.push(
-            `reboot the KVM and wait up to ${
-              args.rebootTimeoutMs / 1000
-            }s for it to come back the same way (no automatic rollback after this point; the backup stays)`,
-          );
-        }
-        if (!args.apply) {
-          const h = await record({
-            applied: false,
-            outcome: "dry-run",
-            message:
-              `would update ${ts.version} → ${target}; pass apply: true to act`,
-          });
-          return { dataHandles: [h] };
-        }
-
-        // 1. Download and verify on the swamp host, with real TLS.
-        const [tgz, sum] = await Promise.all([
-          t.fetch(url, args.transferTimeoutMs),
-          t.fetch(`${url}.sha256`),
-        ]);
-        if (tgz.status !== 200 || sum.status !== 200) {
-          await refuse(
-            `download failed: ${tarball} HTTP ${tgz.status}, .sha256 HTTP ${sum.status}`,
-          );
-        }
-        const want = new TextDecoder().decode(sum.body).trim().split(/\s+/)[0];
-        const got = await sha256Hex(tgz.body);
-        if (!/^[0-9a-f]{64}$/.test(want) || got !== want) {
-          await refuse(
-            `sha256 mismatch for ${tarball}: got ${got}, expected ${want}`,
-          );
-        }
-
-        // 2. Upload and re-verify on the device.
-        context.logger.info("Tailscale update on {host}: {from} → {to}", {
-          host: g.host,
-          from: ts.version,
-          to: target,
-        });
-        const remoteTgz = `/userdata/tailscale-${target}.tgz`;
-        const cleanUp = () =>
-          t.ssh(`rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS}`)
-            .catch(() => null);
-        const up = await t.ssh(
-          `cat > ${remoteTgz} && sha256sum ${remoteTgz}`,
-          tgz.body,
-          args.transferTimeoutMs,
-        );
-        if (up.code !== 0 || up.stdout.trim().split(/\s+/)[0] !== got) {
-          await cleanUp();
-          await refuse(
-            `upload did not verify on the device (exit ${up.code}): ${up.stderr.trim()}`,
-          );
-        }
-
-        // 3. Swap, detached so a dropped session cannot strand it half-done.
-        // Writing the script and launching it are two sessions on purpose: in
-        // `cat > f && nohup sh f &` the `&` backgrounds the whole list, and sh
-        // gives a background job /dev/null as stdin, so cat writes an empty
-        // file and nothing runs (seen live). The byte count proves it landed.
-        const script = new TextEncoder().encode(
-          swapScript(target!, ts.version!),
-        );
-        const wrote = await t.ssh(
-          `rm -f ${SWAP_PID} ${SWAP_STATUS} ${SWAP_LOG} && cat > ${SWAP_SH} && wc -c < ${SWAP_SH}`,
-          script,
-        );
-        if (wrote.code !== 0 || Number(wrote.stdout.trim()) !== script.length) {
-          await cleanUp();
-          await refuse(
-            `the swap script did not land on the device (exit ${wrote.code}, ${
-              wrote.stdout.trim() || 0
-            } of ${script.length} bytes): ${wrote.stderr.trim()}`,
-          );
-        }
-        const swap = await t.ssh(
-          `nohup sh ${SWAP_SH} > ${SWAP_LOG} 2>&1 < /dev/null &`,
-        ).catch((e) => ({
-          code: -1,
-          stdout: "",
-          stderr: (e as Error).message,
-        }));
-        if (swap.code !== 0) {
-          // The session can drop after the job started; only a device that
-          // shows no trace of the script counts as "never started".
-          const st = await swapState(t);
-          if (st.state === "none") {
-            await cleanUp();
-            await refuse(
-              `could not start the swap (exit ${swap.code}): ${swap.stderr.trim()}`,
-            );
-          }
-          context.logger.warn(
-            "swap launch on {host} returned exit {code}, but the device shows it {state}; watching it",
-            { host: g.host, code: swap.code, state: st.state },
-          );
-        }
-
-        // 4. Wait for the node to come back as the same machine. Past the
-        // deadline, keep waiting while the script is still running (a slow tar
-        // on armv7), up to twice the timeout: deciding while it runs would
-        // race it.
-        const rejoined = (p: Probe["tailscale"]) =>
-          p.version === target && p.daemonRunning &&
-          p.backendState === "Running" && p.online === true &&
-          (ts.ip === null || p.ip === ts.ip);
-        let after: Probe["tailscale"] | null = null;
-        let st: SwapState = { state: "unknown", exitCode: null, log: "" };
-        const started = Date.now();
-        while (true) {
-          await sleep(rejoinPoll.intervalMs);
-          after = await probe(t).then((p) => p.tailscale).catch(() => after);
-          if (after && rejoined(after)) break;
-          const elapsed = Date.now() - started;
-          if (elapsed < args.rejoinTimeoutMs) continue;
-          st = await swapState(t);
-          const live = st.state === "running" || st.state === "starting";
-          if (!live || elapsed >= 2 * args.rejoinTimeoutMs) {
-            break;
-          }
-        }
-        // The state check runs after this round's probe, so a swap seen to
-        // exit just now was judged on the probe from before it finished:
-        // look once more before deciding, or a late success reads as failed.
-        if (!(after && rejoined(after)) && st.state === "exited") {
-          after = await probe(t).then((p) => p.tailscale).catch(() => after);
-        }
-
-        if (after && rejoined(after)) {
-          // Each update leaves a ~65 MB backup. Once the new version is proven,
-          // keep only the one this update replaced: it is the rollback source.
-          const keep = `${TS_DIR}/backup-${ts.version}`;
-          const pruned = await t.ssh(pruneBackupsScript(ts.version!)).catch(
-            (e) => ({ code: -1, stdout: "", stderr: (e as Error).message }),
-          );
-          if (pruned.code !== 0) {
-            context.logger.warn(
-              "could not prune old Tailscale backups on {host}: {msg}",
-              { host: g.host, msg: pruned.stderr.trim() },
-            );
-          }
-          const done =
-            `updated ${ts.version} → ${target}; Running, online, ${after.ip}. Backup kept in ${keep}/`;
-          if (!args.rebootAfter) {
-            context.logger.info("{host}: {msg}", { host: g.host, msg: done });
-            const h = await record({
-              applied: true,
-              outcome: "done",
-              message: done,
-              after,
-              sha256: got,
-            });
-            return { dataHandles: [h] };
-          }
-
-          // 4b. Prove it also starts from the boot script. A reboot is seen as
-          // a new kernel boot id; without one to compare, do not reboot.
-          const unverified = async (why: string, last: Probe | null) => {
-            await record({
-              applied: true,
-              outcome: "reboot-unverified",
-              message:
-                `${done}. But ${why}. Restore by hand from ${TS_DIR}/backup-${ts.version}/ if needed`,
-              after: last?.tailscale ?? after,
-              sha256: got,
-            });
-            throw new Error(
-              `Tailscale on ${g.host}: update applied, but ${why}`,
-            );
-          };
-          const pre = await probe(t).catch(() => null);
-          if (!pre?.bootId) {
-            await unverified(
-              "the boot id could not be read before rebooting, so the KVM was not rebooted",
-              pre,
-            );
-          }
-          context.logger.info(
-            "rebooting {host} to verify Tailscale starts at boot",
-            { host: g.host },
-          );
-          const rb = await t.ssh("(sleep 1; reboot) >/dev/null 2>&1 &").catch((
-            e,
-          ) => ({ code: -1, stdout: "", stderr: (e as Error).message }));
-          if (rb.code !== 0) {
-            await unverified(
-              `the reboot command failed (exit ${rb.code}): ${rb.stderr.trim()}`,
-              pre,
-            );
-          }
-          let booted: Probe | null = null;
-          let sawReboot = false;
-          const bootDeadline = Date.now() + args.rebootTimeoutMs;
-          while (Date.now() < bootDeadline) {
-            await sleep(rejoinPoll.intervalMs);
-            const p = await probe(t).catch(() => null);
-            if (!p) continue;
-            booted = p;
-            sawReboot = p.bootId !== null && p.bootId !== pre!.bootId;
-            if (sawReboot && rejoined(p.tailscale)) break;
-          }
-          if (booted && sawReboot && rejoined(booted.tailscale)) {
-            const msg =
-              `${done}. Rebooted: back after boot with ${booted.tailscale.version}, Running, online, ${booted.tailscale.ip} (uptime ${booted.uptimeSeconds}s)`;
-            context.logger.info("{host}: {msg}", { host: g.host, msg });
-            const h = await record({
-              applied: true,
-              outcome: "done",
-              message: msg,
-              after: booted.tailscale,
-              sha256: got,
-            });
-            return { dataHandles: [h] };
-          }
-          await unverified(
-            (!booted
-              ? "the KVM did not answer SSH after the reboot"
-              : !sawReboot
-              ? "the KVM never showed a reboot (boot id unchanged)"
-              : `after the reboot Tailscale is ${booted.tailscale.version}, ${booted.tailscale.backendState}, online=${booted.tailscale.online}, ip=${booted.tailscale.ip}`) +
-              ` within ${args.rebootTimeoutMs / 1000}s`,
-            booted,
-          );
-        }
-
-        const last = after
-          ? `${after.version}, ${after.backendState}, online=${after.online}, ip=${after.ip}`
-          : "no probe";
-        const logText = st.log || "(empty)";
-
-        // 5a. The script is still running, or the device cannot say: rolling
-        // back now would race it. Leave it to a human, with what is known.
-        if (
-          st.state === "running" || st.state === "starting" ||
-          st.state === "unknown"
-        ) {
-          await record({
-            applied: true,
-            outcome: "swap-unconfirmed",
-            message: `the swap is ${st.state} after ${
-              2 * args.rejoinTimeoutMs / 1000
-            }s (last: ${last}); not rolling back while it may still act. Check ${SWAP_LOG} and ${SWAP_STATUS}; backup in ${TS_DIR}/backup-${ts.version}/`,
-            after,
-            sha256: got,
-          });
+        if (args.apply) {
           throw new Error(
-            `Tailscale update on ${g.host} is unconfirmed (swap ${st.state}); swap log:\n${logText}`,
+            "tailscale is read-only since @sntxrr/jetkvm 2026.10.19.1: apply: true is refused, nothing was done. Call tailscaleUpdate to update.",
           );
         }
-
-        // 5b. The script finished without swapping: the device is unchanged.
-        if (!st.log.includes("binaries swapped")) {
-          await record({
-            applied: false,
-            outcome: "unchanged",
-            message: `the swap exited (${st.state}${
-              st.exitCode === null ? "" : ` ${st.exitCode}`
-            }) before swapping; the device is unchanged on ${ts.version} (${last}). Swap log: ${logText}`,
-            after,
-            sha256: got,
-          });
-          throw new Error(
-            `Tailscale update on ${g.host} did not take effect; device unchanged. Swap log:\n${logText}`,
-          );
-        }
-
-        // 5c. It was swapped and did not come back: restore the old binaries.
-        context.logger.warn(
-          "Tailscale on {host} did not rejoin as {to}; rolling back. Swap log: {log}",
-          { host: g.host, to: target, log: logText },
-        );
-        // The script can wait 20 s for the daemon to stop before it copies:
-        // the default per-command timeout would kill it mid-restore.
-        const rbk = await t.ssh(
-          "sh -s",
-          new TextEncoder().encode(rollbackScript(ts.version!)),
-          Math.max(g.timeoutMs, 60000) + 30000,
-        ).catch((e) => ({
-          code: -1,
-          stdout: "",
-          stderr: (e as Error).message,
-        }));
-        let restored: Probe["tailscale"] | null = null;
-        const rbDeadline = Date.now() + args.rejoinTimeoutMs;
-        while (Date.now() < rbDeadline) {
-          await sleep(rejoinPoll.intervalMs);
-          restored = await probe(t).then((p) => p.tailscale).catch(() => null);
-          if (
-            restored?.version === ts.version && restored.daemonRunning &&
-            restored.backendState === "Running"
-          ) break;
-        }
-        const ok = rbk.code === 0 && restored?.version === ts.version &&
-          restored.daemonRunning && restored.backendState === "Running";
-        await record({
-          applied: true,
-          outcome: ok ? "rolled-back" : "rollback-failed",
-          message:
-            `${target} did not rejoin (last: ${last}); rollback exit ${rbk.code}${
-              rbk.code === 0
-                ? ""
-                : ` (${rbk.stderr.trim() || rbk.stdout.trim()})`
-            }, now ${restored?.version ?? "unknown"} ${
-              restored?.backendState ?? ""
-            }${
-              ok
-                ? ""
-                : `. NEEDS A HUMAN: restore from ${TS_DIR}/backup-${ts.version}/`
-            }`,
-          after: restored,
-          sha256: got,
-        });
-        throw new Error(
-          `Tailscale update on ${g.host} ${
-            ok ? "rolled back" : "failed AND its rollback failed"
-          }; swap log:\n${logText}`,
-        );
+        return await runTailscale({ ...args, apply: false }, context);
       },
+    },
+
+    tailscaleUpdate: {
+      description:
+        "Update Tailscale on the JetKVM. Always acts; plan first with `tailscale` action update. " +
+        "The device has no CA store, so `tailscale update` cannot run there: this method downloads the official arm tarball on the swamp host, checks its sha256, streams it over SSH, backs up the running binaries, swaps them, re-runs `tailscale configure jetkvm` and restarts tailscaled without a reboot. " +
+        "It then waits for the node to be Running and online with the same tailnet IP and, with tailnetIp, to answer anonymously over the tailnet from the swamp host; otherwise it restores the backup by itself. " +
+        "The labeled `live` pre-flight checks run first; the method enforces the same conditions itself.",
+      arguments: z.object(UpdateArgsShape),
+      execute: async (
+        args: Omit<TailscaleRunArgs, "action" | "apply">,
+        context: Ctx,
+      ): Promise<{ dataHandles: unknown[] }> =>
+        await runTailscale({ ...args, action: "update", apply: true }, context),
     },
   },
 };
