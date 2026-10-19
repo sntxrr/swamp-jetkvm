@@ -111,7 +111,8 @@ resource.
 
 Moves to `version`, or to the current stable when no version is given. It
 refuses a downgrade unless `allowDowngrade: true` is passed. It also refuses
-when Tailscale is not installed, when `tailscale` and `tailscaled` report
+when Tailscale is not installed, when tailscaled is not `Running` and online
+(an update from there could only roll back), when `tailscale` and `tailscaled` report
 different versions, when the boot script is missing, when
 `/userdata` has less than 256 MB free, and (with `tailnetIp`) when the device
 does not already answer over the tailnet from the swamp host: an update that
@@ -189,7 +190,7 @@ method). The first three share one SSH probe.
 
 | Check                   | Fails when                                                        |
 | ----------------------- | ----------------------------------------------------------------- |
-| `tailscale-installed`   | Tailscale is missing, its version is unreadable, or `tailscaled` is on another version |
+| `tailscale-installed`   | Tailscale is missing, its version is unreadable, `tailscaled` is on another version, or it is not Running and online |
 | `tailscale-boot-script` | `S22tailscale` is missing                                         |
 | `userdata-free-space`   | `/userdata` free space is unreadable or under 256 MB              |
 | `tailnet-path`          | With `tailnetIp`: the device does not answer over the tailnet now |

@@ -1015,7 +1015,21 @@ export function installRefusal(p: Probe): string | null {
     return "Tailscale is not installed (or its version is unreadable); install it with JetKVM's install-tailscale.sh first";
   }
   // Backing up a mixed pair would make the backup itself unrestorable.
-  return binariesMismatch(p);
+  const mixed = binariesMismatch(p);
+  if (mixed) return mixed;
+  // The update counts only a node that rejoins Running and online: from
+  // anything less it can only roll back, and then report a false failure.
+  if (!ts.daemonRunning || ts.backendState !== "Running") {
+    return `tailscaled is ${
+      ts.daemonRunning
+        ? `in state ${ts.backendState ?? "unknown"}`
+        : "not running"
+    }; bring it up first: an update from here could only roll back`;
+  }
+  if (ts.online === false) {
+    return "tailscaled is Running but offline to the coordination server; fix that first: an update from here could only roll back";
+  }
+  return null;
 }
 
 /** See installRefusal. */
@@ -1850,7 +1864,7 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts only once the old version is back online (if it was online before); health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
+        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts only once the old version is back online (if it was online before); health records from before 2026.10.18.1 parse; an update refuses a device whose tailscaled is not Running and online (it could only roll back). New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1862,7 +1876,7 @@ export const model = {
   checks: {
     "tailscale-installed": {
       description:
-        "Tailscale is installed in /userdata/tailscale, reports a version, and tailscaled is on the same one.",
+        "Tailscale is installed in /userdata/tailscale, reports a version, tailscaled is on the same one, and it is Running and online.",
       labels: ["live"],
       appliesTo: ["tailscaleUpdate"],
       execute: (context: { globalArgs: unknown }) =>
