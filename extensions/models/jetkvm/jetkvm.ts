@@ -380,6 +380,7 @@ ts=${TS_DIR}/tailscale
 if [ -x "$ts" ]; then
   echo "ts_installed=1"
   echo "ts_version=$("$ts" version 2>/dev/null | head -1)"
+  echo "ts_daemon_version=$(${TS_DIR}/tailscaled --version 2>/dev/null | head -1)"
   echo "ts_boot=$([ -x ${TS_BOOT} ] && echo 1 || echo 0)"
   echo "ts_daemon=$(pidof tailscaled >/dev/null 2>&1 && echo 1 || echo 0)"
   st=$("$ts" status --json --peers=false 2>/dev/null)
@@ -409,6 +410,8 @@ export interface Probe {
   tailscale: {
     installed: boolean;
     version: string | null;
+    /** tailscaled's own version; differs from `version` only after a swap cut between its renames. */
+    daemonVersion: string | null;
     bootScript: boolean;
     daemonRunning: boolean;
     backendState: string | null;
@@ -452,6 +455,7 @@ export function parseProbe(stdout: string): Probe {
     tailscale: {
       installed: kv.get("ts_installed") === "1",
       version: s("ts_version"),
+      daemonVersion: s("ts_daemon_version"),
       bootScript: kv.get("ts_boot") === "1",
       daemonRunning: kv.get("ts_daemon") === "1",
       backendState: s("ts_backend"),
@@ -649,6 +653,14 @@ export function evaluateHealth(f: HealthFacts): {
           "tailscaled is running but the coordination server sees it offline",
       });
     }
+    const mismatch = binariesMismatch(p);
+    if (mismatch) {
+      findings.push({
+        severity: "warn",
+        code: "tailscale_binaries_mismatch",
+        message: mismatch,
+      });
+    }
     if (!ts.bootScript) {
       findings.push({
         severity: "warn",
@@ -696,6 +708,9 @@ export function evaluateHealth(f: HealthFacts): {
 const TailscaleStateSchema = z.object({
   installed: z.boolean(),
   version: z.string().nullable(),
+  daemonVersion: z.string().nullable().default(null).describe(
+    "tailscaled's own version. Null when unreadable, or on records from before 2026.10.19.2.",
+  ),
   bootScript: z.boolean(),
   daemonRunning: z.boolean(),
   backendState: z.string().nullable(),
@@ -982,13 +997,25 @@ async function deviceCheck(
   return why ? { pass: false, errors: [why] } : { pass: true };
 }
 
+/**
+ * The CLI and the daemon on different versions: a swap was cut between its
+ * two renames (a power cut is the only way past the rollback). The probe reads
+ * the CLI's version, so without this the device would look current. Pure.
+ */
+export function binariesMismatch(p: Probe): string | null {
+  const { version, daemonVersion } = p.tailscale;
+  if (!version || !daemonVersion || version === daemonVersion) return null;
+  return `tailscale is ${version} but tailscaled is ${daemonVersion}: a swap was cut between its two renames; restore both from ${TS_DIR}/backup-*/ and restart tailscaled`;
+}
+
 /** Why an update must not start, judged from device facts; null when it may. Pure. */
 export function installRefusal(p: Probe): string | null {
   const ts = p.tailscale;
   if (!ts.installed || !ts.version || !TS_VERSION.test(ts.version)) {
     return "Tailscale is not installed (or its version is unreadable); install it with JetKVM's install-tailscale.sh first";
   }
-  return null;
+  // Backing up a mixed pair would make the backup itself unrestorable.
+  return binariesMismatch(p);
 }
 
 /** See installRefusal. */
@@ -1028,6 +1055,8 @@ export const SWAP_SH = "/userdata/tailscale-update.sh";
 export const SWAP_LOG = "/userdata/tailscale-update.log";
 export const SWAP_PID = "/userdata/tailscale-update.pid";
 export const SWAP_STATUS = "/userdata/tailscale-update.status";
+/** The kernel boot id at launch: a launch from before a reboot is never "starting". */
+export const SWAP_BOOT = "/userdata/tailscale-update.boot";
 export const ROLLBACK_LOG = "/userdata/tailscale-rollback.log";
 
 /**
@@ -1132,14 +1161,16 @@ export function pruneBackupsScript(keepVersion: string): string {
  * Report the detached swap's state and log. Read-only. A pid file left by a
  * swap killed with the power proves nothing after a reboot (the pid may be
  * reused), so "running" needs that pid to still be the swap script.
- * "starting" needs the script file too: a failed upload's cleanUp removes it
- * but keeps an older run's log, which must not read as a swap.
+ * "starting" needs the script file too (a failed upload's cleanUp removes it
+ * but keeps an older run's log, which must not read as a swap) and a launch
+ * from this boot: power lost before the pid was written must not block every
+ * later update.
  */
 export const SWAP_STATE_SCRIPT =
   `if [ -f ${SWAP_STATUS} ]; then echo "state=exited $(cat ${SWAP_STATUS})"
 elif [ -f ${SWAP_PID} ] && p="$(cat ${SWAP_PID})" && [ -n "$p" ] && kill -0 "$p" 2>/dev/null && tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "${SWAP_SH}"; then echo "state=running"
 elif [ -f ${SWAP_PID} ]; then echo "state=vanished"
-elif [ -f ${SWAP_LOG} ] && [ -f ${SWAP_SH} ]; then echo "state=starting"
+elif [ -f ${SWAP_LOG} ] && [ -f ${SWAP_SH} ] && b="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" && [ -n "$b" ] && [ "$(cat ${SWAP_BOOT} 2>/dev/null)" = "$b" ]; then echo "state=starting"
 else echo "state=none"; fi
 echo "---"
 cat ${SWAP_LOG} 2>/dev/null
@@ -1388,10 +1419,14 @@ async function runTailscale(
   }
 
   // 1. Download and verify on the swamp host, with real TLS.
+  // A throw here (DNS, TLS, the transfer timeout) is a refusal like any
+  // other: recorded, so the update record never lags behind the run.
   const [tgz, sum] = await Promise.all([
     t.fetch(url, args.transferTimeoutMs),
     t.fetch(`${url}.sha256`),
-  ]);
+  ]).catch((e) =>
+    refuse(`download of ${tarball} failed: ${(e as Error).message}`)
+  );
   if (tgz.status !== 200 || sum.status !== 200) {
     await refuse(
       `download failed: ${tarball} HTTP ${tgz.status}, .sha256 HTTP ${sum.status}`,
@@ -1413,7 +1448,7 @@ async function runTailscale(
   });
   const remoteTgz = `/userdata/tailscale-${target}.tgz`;
   const cleanUp = () =>
-    t.ssh(`rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS}`)
+    t.ssh(`rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS} ${SWAP_BOOT}`)
       .catch(() => null);
   const up = await t.ssh(
     `cat > ${remoteTgz} && sha256sum ${remoteTgz}`,
@@ -1436,7 +1471,7 @@ async function runTailscale(
     swapScript(target!, ts.version!),
   );
   const wrote = await t.ssh(
-    `rm -f ${SWAP_PID} ${SWAP_STATUS} ${SWAP_LOG} && cat > ${SWAP_SH} && wc -c < ${SWAP_SH}`,
+    `rm -f ${SWAP_PID} ${SWAP_STATUS} ${SWAP_LOG} ${SWAP_BOOT} && cat > ${SWAP_SH} && wc -c < ${SWAP_SH}`,
     script,
   );
   if (wrote.code !== 0 || Number(wrote.stdout.trim()) !== script.length) {
@@ -1448,7 +1483,7 @@ async function runTailscale(
     );
   }
   const swap = await t.ssh(
-    `nohup sh ${SWAP_SH} > ${SWAP_LOG} 2>&1 < /dev/null &`,
+    `cat /proc/sys/kernel/random/boot_id > ${SWAP_BOOT} 2>/dev/null; nohup sh ${SWAP_SH} > ${SWAP_LOG} 2>&1 < /dev/null &`,
   ).catch((e) => ({
     code: -1,
     stdout: "",
@@ -1776,7 +1811,7 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No global-argument change. tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; health records from before 2026.10.18.1 parse.",
+        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1788,7 +1823,7 @@ export const model = {
   checks: {
     "tailscale-installed": {
       description:
-        "Tailscale is installed in /userdata/tailscale and reports a version.",
+        "Tailscale is installed in /userdata/tailscale, reports a version, and tailscaled is on the same one.",
       labels: ["live"],
       appliesTo: ["tailscaleUpdate"],
       execute: (context: { globalArgs: unknown }) =>
@@ -2080,7 +2115,7 @@ export const model = {
         "The device has no CA store, so `tailscale update` cannot run there: this method downloads the official arm tarball on the swamp host, checks its sha256, streams it over SSH, backs up the running binaries, swaps them, re-runs `tailscale configure jetkvm` and restarts tailscaled without a reboot. " +
         "It then waits for the node to be Running and online with the same tailnet IP (when the old one was readable) and, with tailnetIp, to answer anonymously over the tailnet from the swamp host; otherwise it restores the backup by itself. " +
         "The labeled `live` pre-flight checks run first; the method enforces the same conditions itself. " +
-        "Every outcome is recorded as the `update` instance of the tailscale resource.",
+        "Every outcome after the first device probe is recorded as the `update` instance of the tailscale resource.",
       arguments: z.object(UpdateArgsShape),
       execute: async (
         args: Omit<TailscaleRunArgs, "action" | "apply">,

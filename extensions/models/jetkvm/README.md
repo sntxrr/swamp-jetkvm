@@ -71,6 +71,7 @@ with a sentinel line, and output without it fails.
 | `tailscale_unreachable`         | warn               | With `tailnetIp`: nothing answered on that address          |
 | `tailscale_wrong_device`        | warn               | With `tailnetIp`: something other than this JetKVM answered |
 | `tailscale_ip_changed`          | warn               | With `tailnetIp`: the device reports a different tailnet IP |
+| `tailscale_binaries_mismatch`   | warn               | `tailscale` and `tailscaled` report different versions: a swap was cut between its renames |
 | `tailscale_not_installed`       | info               |                                                             |
 | `developer_mode_enabled`        | info (warn strict) | Root SSH is open to the installed key                       |
 
@@ -110,7 +111,8 @@ resource.
 
 Moves to `version`, or to the current stable when no version is given. It
 refuses a downgrade unless `allowDowngrade: true` is passed. It also refuses
-when Tailscale is not installed, when the boot script is missing, when
+when Tailscale is not installed, when `tailscale` and `tailscaled` report
+different versions, when the boot script is missing, when
 `/userdata` has less than 256 MB free, and (with `tailnetIp`) when the device
 does not already answer over the tailnet from the swamp host: an update that
 cannot be verified would only roll back. It:
@@ -158,15 +160,21 @@ part-way never leaves the daemon down. It logs `swapping binaries` before the
 first rename, and a script that dies after that line (the two binaries may be
 on different versions) is rolled back, never reported `unchanged`. A PID file
 left by a swap killed with the power does not block the next update: a swap
-counts as running only while that PID is still the swap script. The reboot check compares the kernel
+counts as running only while that PID is still the swap script, and a launch
+whose PID was never written counts as starting only within the same boot. Power
+lost between the two renames leaves `tailscale` and `tailscaled` on different
+versions; `health` reports `tailscale_binaries_mismatch` and the update refuses
+until both are restored from the backup. The reboot check compares the kernel
 boot ID, and is skipped (`reboot-unverified`, no reboot) if it cannot be read
 first. The "same tailnet IP" check applies when the probe can read an IPv4
 tailnet address.
 
-Every outcome, refusals included, is recorded as the **`update` instance** of
+Every outcome after the first device probe, refusals included (a download
+that fails is one), is recorded as the **`update` instance** of
 the `tailscale` resource (since 2026.10.19.2; before that it shared the
 `tailscale` instance with status and plans, so a later status run could hide a
-failed update). Read it with `data.latest("<model>", "update")`. Each record
+failed update). Read it with `data.latest("<model>", "update")`. A run that
+cannot probe the device at all throws before anything is recorded. Each record
 carries `tailnet`: the last tailnet probe (after the swap, the rollback or the
 reboot; before it for a refusal), or null without `tailnetIp`.
 
@@ -176,7 +184,7 @@ method). The first three share one SSH probe.
 
 | Check                   | Fails when                                                        |
 | ----------------------- | ----------------------------------------------------------------- |
-| `tailscale-installed`   | Tailscale is missing or its version is unreadable                 |
+| `tailscale-installed`   | Tailscale is missing, its version is unreadable, or `tailscaled` is on another version |
 | `tailscale-boot-script` | `S22tailscale` is missing                                         |
 | `userdata-free-space`   | `/userdata` free space is unreadable or under 256 MB              |
 | `tailnet-path`          | With `tailnetIp`: the device does not answer over the tailnet now |

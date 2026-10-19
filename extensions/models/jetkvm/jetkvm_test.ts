@@ -459,6 +459,7 @@ class FakeJetKvm implements Transport {
       return this.ok(probeText(
         {
           ts_version: this.tsVersion,
+          ts_daemon_version: this.tsVersion,
           ts_online: String(this.online),
           uptime: String(this.uptime),
           boot_id: this.bootId,
@@ -1747,7 +1748,11 @@ Deno.test("a tailscale record from before 2026.10.19.1 (no tailnet field) still 
 Deno.test("SWAP_STATE_SCRIPT on a real sh: an old log or a stale pid never reads as a swap in progress", async () => {
   const dir = await Deno.makeTempDir();
   try {
-    const script = SWAP_STATE_SCRIPT.replaceAll("/userdata", dir);
+    const script = SWAP_STATE_SCRIPT.replaceAll(
+      "/proc/sys/kernel/random/boot_id",
+      `${dir}/boot_id`,
+    ).replaceAll("/userdata", dir);
+    await Deno.writeTextFile(`${dir}/boot_id`, "boot-2\n");
     const state = async () => {
       const out = await new Deno.Command("sh", {
         args: ["-c", script],
@@ -1759,8 +1764,14 @@ Deno.test("SWAP_STATE_SCRIPT on a real sh: an old log or a stale pid never reads
     // What a failed upload's cleanUp leaves: an older run's log, no script.
     await Deno.writeTextFile(`${dir}/tailscale-update.log`, "exit 0\n");
     assertEquals(await state(), "none", "an old log alone must not block");
+    await Deno.writeTextFile(`${dir}/tailscale-update.boot`, "boot-2\n");
+    assertEquals(await state(), "none", "no script file: nothing can start");
     await Deno.writeTextFile(`${dir}/tailscale-update.sh`, "sleep 5\n");
-    assertEquals(await state(), "starting", "script and log, pid not yet");
+    // Power lost after the launch, before the pid: a launch from an older boot.
+    await Deno.writeTextFile(`${dir}/tailscale-update.boot`, "boot-1\n");
+    assertEquals(await state(), "none", "a launch from before a reboot");
+    await Deno.writeTextFile(`${dir}/tailscale-update.boot`, "boot-2\n");
+    assertEquals(await state(), "starting", "launched this boot, pid not yet");
     // After a power cut the pid may belong to anything; here, this test.
     await Deno.writeTextFile(`${dir}/tailscale-update.pid`, `${Deno.pid}\n`);
     assertEquals(await state(), "vanished", "a live pid that is not the swap");
@@ -1845,4 +1856,56 @@ Deno.test("tailscaleUpdate records the update instance; a later status run canno
     await names(new FakeJetKvm(), "tailscale", { action: "update" }),
     ["tailscale/tailscale"],
   );
+});
+
+Deno.test("a swap cut between its renames (CLI new, daemon old) is a health finding and refuses the update", async () => {
+  const fake = new FakeJetKvm({ probeOver: { ts_daemon_version: "1.96.0" } });
+  const d = await runHealth(fake);
+  const f = d.findings.find((x: any) =>
+    x.code === "tailscale_binaries_mismatch"
+  );
+  assert(f, "mismatch finding");
+  assertEquals(f.severity, "warn");
+  assertEquals(d.tailscale.daemonVersion, "1.96.0");
+  const r = await runCheck("tailscale-installed", {
+    "192.0.2.10": new FakeJetKvm({
+      probeOver: { ts_daemon_version: "1.96.0" },
+    }),
+  });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "cut between its two renames");
+  const up = new FakeJetKvm({ probeOver: { ts_daemon_version: "1.96.0" } });
+  const { w, error } = await applied(up);
+  assertEquals(w.outcome, "refused");
+  assertStringIncludes(String(error), "tailscaled is 1.96.0");
+  assertEquals(deviceWrites(up).length, 0);
+  // Unreadable daemon version: no finding, no refusal.
+  const quiet = await runHealth(
+    new FakeJetKvm({ probeOver: { ts_daemon_version: "" } }),
+  );
+  assert(
+    !quiet.findings.some((x: any) => x.code === "tailscale_binaries_mismatch"),
+  );
+});
+
+Deno.test("a download that throws is recorded as refused, and the device is untouched", async () => {
+  const fake = new FakeJetKvm();
+  const orig = fake.fetch.bind(fake);
+  fake.fetch = (url: string) =>
+    url.endsWith(".tgz") ? Promise.reject(new Error("dns error")) : orig(url);
+  const { w, error } = await applied(fake);
+  assertEquals(w.outcome, "refused");
+  assertStringIncludes(w.message, "dns error");
+  assertStringIncludes(String(error), "download");
+  assertEquals(deviceWrites(fake).length, 0);
+});
+
+Deno.test("the launch records the boot id before starting the swap; cleanUp and the write step clear it", () => {
+  const src = Deno.readTextFileSync(new URL("./jetkvm.ts", import.meta.url));
+  assertStringIncludes(
+    src,
+    "cat /proc/sys/kernel/random/boot_id > ${SWAP_BOOT} 2>/dev/null; nohup sh",
+  );
+  assertStringIncludes(src, "${SWAP_STATUS} ${SWAP_BOOT}`)");
+  assertStringIncludes(src, "${SWAP_LOG} ${SWAP_BOOT} && cat >");
 });
