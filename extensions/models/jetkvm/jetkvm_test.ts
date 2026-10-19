@@ -1906,6 +1906,6 @@ Deno.test("the launch records the boot id before starting the swap; cleanUp and 
     src,
     "cat /proc/sys/kernel/random/boot_id > ${SWAP_BOOT} 2>/dev/null; nohup sh",
   );
-  assertStringIncludes(src, "${SWAP_STATUS} ${SWAP_BOOT}`)");
+  assertStringIncludes(src, "${SWAP_PID} ${SWAP_STATUS} ${SWAP_BOOT}`");
   assertStringIncludes(src, "${SWAP_LOG} ${SWAP_BOOT} && cat >");
 });

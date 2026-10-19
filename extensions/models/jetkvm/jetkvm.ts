@@ -1448,7 +1448,9 @@ async function runTailscale(
   });
   const remoteTgz = `/userdata/tailscale-${target}.tgz`;
   const cleanUp = () =>
-    t.ssh(`rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS} ${SWAP_BOOT}`)
+    t.ssh(
+      `rm -f ${remoteTgz} ${SWAP_SH} ${SWAP_PID} ${SWAP_STATUS} ${SWAP_BOOT}`,
+    )
       .catch(() => null);
   const up = await t.ssh(
     `cat > ${remoteTgz} && sha256sum ${remoteTgz}`,
