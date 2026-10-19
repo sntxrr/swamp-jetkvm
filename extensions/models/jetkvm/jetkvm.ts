@@ -130,6 +130,15 @@ export function sshArgs(
     "-T",
     "-o",
     "BatchMode=yes",
+    // The session is a root shell on an appliance: never hand it the
+    // operator's agent or any forwarding, whatever ~/.ssh/config says
+    // (command-line options win over the config file).
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ClearAllForwardings=yes",
     "-o",
     "StrictHostKeyChecking=yes",
     "-o",
@@ -726,8 +735,8 @@ const HealthSchema = z.object({
   developerMode: z.boolean().nullable(),
   tailscale: TailscaleStateSchema.nullable(),
   latestTailscale: z.string().nullable(),
-  tailnet: TailnetProbeSchema.nullable().describe(
-    "The anonymous probe of tailnetIp (/metrics and the SSH host key). Null when no tailnetIp is set. Recorded even when SSH on the LAN fails.",
+  tailnet: TailnetProbeSchema.nullable().default(null).describe(
+    "The anonymous probe of tailnetIp (/metrics and the SSH host key). Null when no tailnetIp is set, or on records from before 2026.10.18.1. Recorded even when SSH on the LAN fails.",
   ),
   error: z.string().nullable(),
 });
@@ -901,8 +910,12 @@ export function describeTailnet(p: TailnetProbe | null): string {
   return `${p.ip} answers`;
 }
 
-/** Free space an update needs: tarball (~30 MB) + staged copy and backup (~65 MB each). */
-export const NEED_FREE_KB = 200 * 1024;
+/**
+ * Free space an update needs. At the peak /userdata holds the tarball
+ * (~30 MB), the staged copy, the backup and the .new copies beside the
+ * running binaries (~65 MB each): ~225 MB, rounded up for margin.
+ */
+export const NEED_FREE_KB = 256 * 1024;
 
 /**
  * The pre-flight checks each need the same device facts. They run back to
@@ -1061,6 +1074,7 @@ cp "$src/tailscale" ${TS_DIR}/tailscale.new
 cp "$src/tailscaled" ${TS_DIR}/tailscaled.new
 ${TS_BOOT} stop || true
 i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+log "swapping binaries"
 mv ${TS_DIR}/tailscale.new ${TS_DIR}/tailscale
 mv ${TS_DIR}/tailscaled.new ${TS_DIR}/tailscaled
 log "binaries swapped"
@@ -1114,12 +1128,18 @@ export function pruneBackupsScript(keepVersion: string): string {
   return `for d in ${TS_DIR}/backup-*; do [ -d "$d" ] && [ "$d" != ${TS_DIR}/backup-${keepVersion} ] && rm -rf "$d"; done; true`;
 }
 
-/** Report the detached swap's state and log. Read-only. */
+/**
+ * Report the detached swap's state and log. Read-only. A pid file left by a
+ * swap killed with the power proves nothing after a reboot (the pid may be
+ * reused), so "running" needs that pid to still be the swap script.
+ * "starting" needs the script file too: a failed upload's cleanUp removes it
+ * but keeps an older run's log, which must not read as a swap.
+ */
 export const SWAP_STATE_SCRIPT =
   `if [ -f ${SWAP_STATUS} ]; then echo "state=exited $(cat ${SWAP_STATUS})"
-elif [ -f ${SWAP_PID} ] && kill -0 "$(cat ${SWAP_PID})" 2>/dev/null; then echo "state=running"
+elif [ -f ${SWAP_PID} ] && p="$(cat ${SWAP_PID})" && [ -n "$p" ] && kill -0 "$p" 2>/dev/null && tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "${SWAP_SH}"; then echo "state=running"
 elif [ -f ${SWAP_PID} ]; then echo "state=vanished"
-elif [ -f ${SWAP_LOG} ]; then echo "state=starting"
+elif [ -f ${SWAP_LOG} ] && [ -f ${SWAP_SH} ]; then echo "state=starting"
 else echo "state=none"; fi
 echo "---"
 cat ${SWAP_LOG} 2>/dev/null
@@ -1259,20 +1279,26 @@ async function runTailscale(
       outcome: rec.outcome,
       message: rec.message,
     });
-    return context.writeResource("tailscale", "tailscale", {
-      host: g.host,
-      at: new Date().toISOString(),
-      action: args.action,
-      fromVersion: ts.version,
-      targetVersion: target,
-      latestVersion: latest,
-      before: ts,
-      steps,
-      ...rec,
-      after: rec.after ?? null,
-      sha256: rec.sha256 ?? null,
-      tailnet: lastTailnet,
-    });
+    // Updates get their own instance: a later status or plan must not
+    // become the latest record over a failed update.
+    return context.writeResource(
+      "tailscale",
+      args.apply ? "update" : "tailscale",
+      {
+        host: g.host,
+        at: new Date().toISOString(),
+        action: args.action,
+        fromVersion: ts.version,
+        targetVersion: target,
+        latestVersion: latest,
+        before: ts,
+        steps,
+        ...rec,
+        after: rec.after ?? null,
+        sha256: rec.sha256 ?? null,
+        tailnet: lastTailnet,
+      },
+    );
   };
   const refuse = async (why: string): Promise<never> => {
     await record({ applied: false, outcome: "refused", message: why });
@@ -1644,8 +1670,10 @@ async function runTailscale(
     );
   }
 
-  // 5b. The script finished without swapping: the device is unchanged.
-  if (!st.log.includes("binaries swapped")) {
+  // 5b. The script finished before touching the binaries: the device is
+  // unchanged. Once it logged "swapping binaries" the two may be on
+  // different versions, so anything short of a rejoin restores the backup.
+  if (!st.log.includes("swapping binaries")) {
     await record({
       applied: false,
       outcome: "unchanged",
@@ -1748,7 +1776,7 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No code or argument change. The package description now lists all five pre-flight checks (swap-not-running was missing).",
+        "No global-argument change. tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; health records from before 2026.10.18.1 parse.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1776,7 +1804,7 @@ export const model = {
     },
     "userdata-free-space": {
       description:
-        "/userdata has room for the tarball, the staged binaries and a backup (200 MB).",
+        "/userdata has room for the tarball, the staged binaries, a backup and the new copies (256 MB).",
       labels: ["live"],
       appliesTo: ["tailscaleUpdate"],
       execute: (context: { globalArgs: unknown }) =>
@@ -1826,7 +1854,7 @@ export const model = {
     },
     tailscale: {
       description:
-        "Tailscale state on the device and the outcome of an update.",
+        "Tailscale on the device. Instance `tailscale`: status and plans from the read-only `tailscale` method. Instance `update`: every outcome of `tailscaleUpdate` (since 2026.10.19.2), so a later status or plan never hides a failed update.",
       schema: TailscaleSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
@@ -2050,8 +2078,9 @@ export const model = {
       description:
         "Update Tailscale on the JetKVM. Always acts; plan first with `tailscale` action update. " +
         "The device has no CA store, so `tailscale update` cannot run there: this method downloads the official arm tarball on the swamp host, checks its sha256, streams it over SSH, backs up the running binaries, swaps them, re-runs `tailscale configure jetkvm` and restarts tailscaled without a reboot. " +
-        "It then waits for the node to be Running and online with the same tailnet IP and, with tailnetIp, to answer anonymously over the tailnet from the swamp host; otherwise it restores the backup by itself. " +
-        "The labeled `live` pre-flight checks run first; the method enforces the same conditions itself.",
+        "It then waits for the node to be Running and online with the same tailnet IP (when the old one was readable) and, with tailnetIp, to answer anonymously over the tailnet from the swamp host; otherwise it restores the backup by itself. " +
+        "The labeled `live` pre-flight checks run first; the method enforces the same conditions itself. " +
+        "Every outcome is recorded as the `update` instance of the tailscale resource.",
       arguments: z.object(UpdateArgsShape),
       execute: async (
         args: Omit<TailscaleRunArgs, "action" | "apply">,

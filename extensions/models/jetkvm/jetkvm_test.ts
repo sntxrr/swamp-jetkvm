@@ -52,6 +52,10 @@ Deno.test("sshArgs refuses unknown host keys, never prompts, and pins when given
   assertStringIncludes(plain.join(" "), "BatchMode=yes");
   assertStringIncludes(plain.join(" "), "StrictHostKeyChecking=yes");
   assertStringIncludes(plain.join(" "), "ControlPath=none");
+  // A root shell on the appliance never gets the operator's agent.
+  assertStringIncludes(plain.join(" "), "ForwardAgent=no");
+  assertStringIncludes(plain.join(" "), "ForwardX11=no");
+  assertStringIncludes(plain.join(" "), "ClearAllForwardings=yes");
   assert(!plain.join(" ").includes("UserKnownHostsFile"));
   assertEquals(plain.slice(-3), ["--", "192.0.2.10", "sh -s"]);
   assert(!plain.includes("-n"), "stdin carries the script; -n would empty it");
@@ -344,7 +348,8 @@ class FakeJetKvm implements Transport {
   uptime = 5000;
   bootId = "boot-1";
   /** ok: swaps and rejoins. stuck: swaps, never online. slow: running for `slowProbes` probes, then ok. hang: running forever. noop: exits 3 before swapping. */
-  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" | "starting" = "ok";
+  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" | "starting" | "partial" =
+    "ok";
   slowProbes = 0;
   /** With swapPlan "starting": state checks before the swap finishes. */
   startingChecks = Infinity;
@@ -420,7 +425,7 @@ class FakeJetKvm implements Transport {
     this.swap = {
       state: "exited",
       code: 0,
-      log: "backup ready\nbinaries swapped\nSWAP_DONE",
+      log: "backup ready\nswapping binaries\nbinaries swapped\nSWAP_DONE",
     };
   }
 
@@ -498,6 +503,13 @@ class FakeJetKvm implements Transport {
         if (this.swapPlan === "starting") {
           // The redirect created the log, and sh has not written its pid yet.
           this.swap = { state: "starting", code: null, log: "" };
+        } else if (this.swapPlan === "partial") {
+          // Killed after the first rename: tailscale is new, tailscaled old.
+          this.swap = {
+            state: "exited",
+            code: 143,
+            log: "backup ready\nswapping binaries\nexit 143",
+          };
         } else if (this.swapPlan === "noop") {
           this.swap = {
             state: "exited",
@@ -1383,6 +1395,8 @@ Deno.test("each device check fails on its own condition, with the method's wordi
       ["tailscale-boot-script", { ts_boot: "0" }, "S22tailscale"],
       ["userdata-free-space", { disk: "" }, "could not read free space"],
       ["userdata-free-space", { disk: "13830232,102400" }, "100 MB free"],
+      // ~225 MB at the peak: tarball, staged copy, backup and .new copies.
+      ["userdata-free-space", { disk: "13830232,235520" }, "256 MB needed"],
     ] as const
   ) {
     const r = await runCheck(name, {
@@ -1728,4 +1742,107 @@ Deno.test("a tailscale record from before 2026.10.19.1 (no tailnet field) still 
     steps: [],
   };
   assertEquals(model.resources.tailscale.schema.parse(old).tailnet, null);
+});
+
+Deno.test("SWAP_STATE_SCRIPT on a real sh: an old log or a stale pid never reads as a swap in progress", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const script = SWAP_STATE_SCRIPT.replaceAll("/userdata", dir);
+    const state = async () => {
+      const out = await new Deno.Command("sh", {
+        args: ["-c", script],
+        stdout: "piped",
+      }).output();
+      return parseSwapState(dec(out.stdout)).state;
+    };
+    assertEquals(await state(), "none");
+    // What a failed upload's cleanUp leaves: an older run's log, no script.
+    await Deno.writeTextFile(`${dir}/tailscale-update.log`, "exit 0\n");
+    assertEquals(await state(), "none", "an old log alone must not block");
+    await Deno.writeTextFile(`${dir}/tailscale-update.sh`, "sleep 5\n");
+    assertEquals(await state(), "starting", "script and log, pid not yet");
+    // After a power cut the pid may belong to anything; here, this test.
+    await Deno.writeTextFile(`${dir}/tailscale-update.pid`, `${Deno.pid}\n`);
+    assertEquals(await state(), "vanished", "a live pid that is not the swap");
+    await Deno.writeTextFile(`${dir}/tailscale-update.pid`, "\n");
+    assertEquals(await state(), "vanished", "an empty pid file");
+    // /proc exists on the device (Linux); prove "running" where it can be.
+    if (await Deno.stat("/proc/self/cmdline").then(() => true, () => false)) {
+      const child = new Deno.Command("sh", {
+        args: [`${dir}/tailscale-update.sh`],
+      }).spawn();
+      try {
+        await Deno.writeTextFile(
+          `${dir}/tailscale-update.pid`,
+          `${child.pid}\n`,
+        );
+        assertEquals(await state(), "running");
+      } finally {
+        child.kill();
+        await child.status;
+      }
+    }
+    await Deno.writeTextFile(`${dir}/tailscale-update.status`, "0\n");
+    assertEquals(await state(), "exited");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("the swap script logs 'swapping binaries' before the first rename", () => {
+  const s = swapScript(NEW, OLD);
+  const mark = s.indexOf('log "swapping binaries"');
+  assert(mark > 0);
+  assert(mark < s.indexOf(`mv /userdata/tailscale/tailscale.new`));
+  assert(s.indexOf('log "binaries swapped"') > mark);
+});
+
+Deno.test("a swap that died between its two renames is rolled back, not reported unchanged", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "partial";
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "rolled back");
+  assertEquals(w.outcome, "rolled-back");
+  assert(sent(fake, "ROLLBACK_DONE"), "the backup must be restored");
+});
+
+Deno.test("a health record from before 2026.10.18.1 (no tailnet field) still parses, as null", async () => {
+  const d = await runHealth(new FakeJetKvm());
+  delete d.tailnet;
+  assertEquals(model.resources.health.schema.parse(d).tailnet, null);
+});
+
+Deno.test("tailscaleUpdate records the update instance; a later status run cannot hide it", async () => {
+  const names = async (
+    fake: FakeJetKvm,
+    method: "tailscale" | "tailscaleUpdate",
+    a: Record<string, unknown>,
+  ) => {
+    const { context, getWrittenResources } = ctx();
+    await withFake(
+      fake,
+      () =>
+        (model.methods[method].execute as any)(
+          parseArgs(method, a),
+          context as any,
+        ),
+    ).catch(() => {});
+    return getWrittenResources().map((w) => `${w.specName}/${w.name}`);
+  };
+  const stuck = new FakeJetKvm();
+  stuck.swapPlan = "stuck";
+  assertEquals(await names(stuck, "tailscaleUpdate", APPLY), [
+    "tailscale/update",
+  ]);
+  const refused = new FakeJetKvm({ probeOver: { ts_installed: "0" } });
+  assertEquals(await names(refused, "tailscaleUpdate", APPLY), [
+    "tailscale/update",
+  ]);
+  assertEquals(await names(new FakeJetKvm(), "tailscale", {}), [
+    "tailscale/tailscale",
+  ]);
+  assertEquals(
+    await names(new FakeJetKvm(), "tailscale", { action: "update" }),
+    ["tailscale/tailscale"],
+  );
 });
