@@ -1863,7 +1863,14 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts once the old version is back in the state it had before (Running and online only if it was); health records from before 2026.10.18.1 parse; the tailnet-path refusal applies only to a device that reports itself Running and online, so a broken device can still be updated. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
+        "No global-argument change. BREAKING for readers of update outcomes: " +
+        "tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; " +
+        "the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); " +
+        "SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; " +
+        "a swap that died between its two renames is rolled back instead of reported unchanged; " +
+        "the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts once the old version is back in the state it had before (Running and online only if it was); " +
+        "health records from before 2026.10.18.1 parse; the tailnet-path refusal applies only to a device that reports itself Running and online, so a broken device can still be updated. " +
+        "New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
