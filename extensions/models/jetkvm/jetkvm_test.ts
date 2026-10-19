@@ -2114,3 +2114,40 @@ Deno.test("a device that was Running before, restored but not Running, is rollba
   const { w } = await applied(fake);
   assertEquals(w.outcome, "rollback-failed");
 });
+
+Deno.test("with tailnetIp, a device that is down or logged out is not refused for its missing path; the update must still prove one", async () => {
+  const g = {
+    host: "192.0.2.10",
+    tailnetIp: "198.51.100.7",
+    hostKey: PINNED_KEY,
+  };
+  for (
+    const over of [
+      { ts_daemon: "0" },
+      { ts_backend: "NeedsLogin" },
+      { ts_online: "false" },
+    ] as Record<string, string>[]
+  ) {
+    const r = await runCheck("tailnet-path", {
+      "192.0.2.10": new FakeJetKvm({ probeOver: over }),
+      "198.51.100.7": new FakeJetKvm({ httpDown: true }),
+    }, g);
+    assertEquals(r.pass, true, JSON.stringify(over));
+  }
+  // The method: a logged-out device whose path is dead, fixed by the update
+  // only if the path then answers. Here it never does: rolled back, and the
+  // restore to the same logged-out state is not a false alarm.
+  const lan = new FakeJetKvm();
+  lan.backendBefore = "NeedsLogin";
+  const tail = new TailnetFake(lan, () => true); // never answers
+  const { w, error } = await appliedVia(lan, tail);
+  assertEquals(w.outcome, "rolled-back", String(error));
+  // ...and a device the update fixes, whose path then answers, is done.
+  const lan2 = new FakeJetKvm();
+  lan2.backendBefore = "NeedsLogin";
+  const ok = await appliedVia(
+    lan2,
+    new TailnetFake(lan2, (l) => l.backendBefore !== null),
+  );
+  assertEquals(ok.w.outcome, "done");
+});

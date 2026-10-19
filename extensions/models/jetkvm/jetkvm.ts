@@ -1042,12 +1042,23 @@ export function freeSpaceRefusal(p: Probe): string | null {
 export function tailnetRefusal(
   t: TailnetProbe | null,
   hostKeyPinned: boolean,
+  device: Probe["tailscale"],
 ): string | null {
+  // Only a device that says it is healthy is held to the path up front: a
+  // down, logged-out or offline one has no path, and may be exactly what the
+  // update is for. It still has to answer over the tailnet after the swap.
+  if (!deviceHealthy(device)) return null;
   return tailnetVerified(t, hostKeyPinned)
     ? null
     : `the tailnet path from this host is already broken (${
       describeTailnet(t)
     }), so a swap could not be verified and would roll back; fix that first`;
+}
+
+/** tailscaled running, Running and online by its own account. Pure. */
+export function deviceHealthy(ts: Probe["tailscale"]): boolean {
+  return ts.daemonRunning && ts.backendState === "Running" &&
+    ts.online === true;
 }
 
 /**
@@ -1405,7 +1416,7 @@ async function runTailscale(
   // A path that is already broken would make a good update look failed and
   // roll it back; say so up front instead.
   lastTailnet = await probeTailnet(g);
-  const path = tailnetRefusal(lastTailnet, Boolean(g.hostKey));
+  const path = tailnetRefusal(lastTailnet, Boolean(g.hostKey), ts);
   if (path) await refuse(path);
   const prior = swapRunningRefusal(await swapState(t));
   if (prior) await refuse(prior);
@@ -1852,7 +1863,7 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts once the old version is back in the state it had before (Running and online only if it was); health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
+        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts once the old version is back in the state it had before (Running and online only if it was); health records from before 2026.10.18.1 parse; the tailnet-path refusal applies only to a device that reports itself Running and online, so a broken device can still be updated. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1888,14 +1899,20 @@ export const model = {
     },
     "tailnet-path": {
       description:
-        "With tailnetIp, the device already answers over the tailnet from this host; otherwise the update could not be verified. Passes when no tailnetIp is set.",
+        "With tailnetIp, a device that reports itself Running and online already answers over the tailnet from this host; otherwise the update could not be verified. Passes when no tailnetIp is set, and for a device that is down, logged out or offline (it has no path yet; the update must still prove one).",
       labels: ["live"],
       appliesTo: ["tailscaleUpdate"],
       execute: async (context: { globalArgs: unknown }) => {
         let why: string | null;
         try {
           const g = GlobalArgsSchema.parse(context.globalArgs);
-          why = tailnetRefusal(await probeTailnet(g), Boolean(g.hostKey));
+          if (!g.tailnetIp) return { pass: true };
+          const device = (await probeForChecks(g).p).tailscale;
+          why = tailnetRefusal(
+            await probeTailnet(g),
+            Boolean(g.hostKey),
+            device,
+          );
         } catch (e) {
           why = `could not probe the tailnet path: ${(e as Error).message}`;
         }

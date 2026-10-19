@@ -152,7 +152,7 @@ The `outcome` says what happened, and which ones need a human:
 | ------------------- | ------------------------------------------------------------------------- |
 | `done`              | Updated and rejoined (and, with `rebootAfter`, rejoined after a reboot)   |
 | `unchanged`         | The swap exited before touching the binaries; the message says if tailscaled is not back up |
-| `rolled-back`       | Swapped, did not rejoin (or did not answer over the tailnet), old binaries restored and running |
+| `rolled-back`       | Swapped, did not rejoin (or did not answer over the tailnet), old binaries restored and back in the state they were in before |
 | `rollback-failed`   | **Needs a human**: the restore did not bring the old version back up      |
 | `swap-unconfirmed`  | **Needs a human**: the swap was still running or unreadable at 2x timeout |
 | `reboot-unverified` | Updated, but the reboot check did not pass; the backup is still there     |
