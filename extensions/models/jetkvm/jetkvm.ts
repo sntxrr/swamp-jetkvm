@@ -1005,7 +1005,7 @@ async function deviceCheck(
 export function binariesMismatch(p: Probe): string | null {
   const { version, daemonVersion } = p.tailscale;
   if (!version || !daemonVersion || version === daemonVersion) return null;
-  return `tailscale is ${version} but tailscaled is ${daemonVersion}: a swap was cut between its two renames; restore both from ${TS_DIR}/backup-*/ and restart tailscaled`;
+  return `tailscale is ${version} but tailscaled is ${daemonVersion}: a swap was cut between its two renames; restore both from ${TS_DIR}/backup-${daemonVersion}/ (tailscale is renamed first, so the daemon still has the old version) and restart tailscaled`;
 }
 
 /** Why an update must not start, judged from device facts; null when it may. Pure. */
@@ -1511,8 +1511,12 @@ async function runTailscale(
   // deadline, keep waiting while the script is still running (a slow tar
   // on armv7), up to twice the timeout: deciding while it runs would
   // race it.
+  // The daemon's own version too: a failed second rename leaves the old
+  // tailscaled running beside the new CLI.
   const rejoined = (p: Probe["tailscale"]) =>
-    p.version === target && p.daemonRunning &&
+    p.version === target &&
+    (p.daemonVersion === null || p.daemonVersion === target) &&
+    p.daemonRunning &&
     p.backendState === "Running" && p.online === true &&
     (ts.ip === null || p.ip === ts.ip);
   // The device's own report is not enough: on 2026-10-19 a swapped JetKVM said
@@ -1742,17 +1746,17 @@ async function runTailscale(
     stderr: (e as Error).message,
   }));
   let restored: Probe["tailscale"] | null = null;
+  const restoredRunning = (r: Probe["tailscale"] | null) =>
+    r?.version === ts.version &&
+    (r.daemonVersion === null || r.daemonVersion === ts.version) &&
+    r.daemonRunning && r.backendState === "Running";
   const rbDeadline = Date.now() + args.rejoinTimeoutMs;
   while (Date.now() < rbDeadline) {
     await sleep(rejoinPoll.intervalMs);
     restored = await probe(t).then((p) => p.tailscale).catch(() => null);
-    if (
-      restored?.version === ts.version && restored.daemonRunning &&
-      restored.backendState === "Running"
-    ) break;
+    if (restoredRunning(restored)) break;
   }
-  const restoredOk = rbk.code === 0 && restored?.version === ts.version &&
-    restored.daemonRunning && restored.backendState === "Running";
+  const restoredOk = rbk.code === 0 && restoredRunning(restored);
   // Recorded, not judged: the old version is what worked before, and whether
   // its path came back says whether the new version was really the cause.
   await freshTailnet();

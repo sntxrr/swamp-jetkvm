@@ -13,6 +13,7 @@ import {
   describeTailnet,
   evaluateHealth,
   type HttpResult,
+  installRefusal,
   model,
   parseMetrics,
   parseProbe,
@@ -1908,4 +1909,21 @@ Deno.test("the launch records the boot id before starting the swap; cleanUp and 
   );
   assertStringIncludes(src, "${SWAP_PID} ${SWAP_STATUS} ${SWAP_BOOT}`");
   assertStringIncludes(src, "${SWAP_LOG} ${SWAP_BOOT} && cat >");
+});
+
+Deno.test("a swap whose daemon stayed on the old version (second rename failed) is rolled back, not done", async () => {
+  // The CLI reports the new version after the swap; tailscaled never changes.
+  const fake = new FakeJetKvm({ probeOver: { ts_daemon_version: OLD } });
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "rolled back");
+  assertEquals(w.outcome, "rolled-back");
+  assert(sent(fake, "ROLLBACK_DONE"));
+});
+
+Deno.test("the mismatch message names the exact backup: the daemon's version", () => {
+  const p = parseProbe(probeText({ ts_daemon_version: "1.96.0" }));
+  assertStringIncludes(
+    String(installRefusal(p)),
+    "/userdata/tailscale/backup-1.96.0/",
+  );
 });
