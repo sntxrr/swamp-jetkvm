@@ -1907,14 +1907,22 @@ export const model = {
         try {
           const g = GlobalArgsSchema.parse(context.globalArgs);
           if (!g.tailnetIp) return { pass: true };
-          const device = (await probeForChecks(g).p).tailscale;
+          const device = await probeForChecks(g).p.then(
+            (p) => p.tailscale,
+            (e) => {
+              throw new Error(`could not probe the device: ${e.message}`);
+            },
+          );
           why = tailnetRefusal(
             await probeTailnet(g),
             Boolean(g.hostKey),
             device,
           );
         } catch (e) {
-          why = `could not probe the tailnet path: ${(e as Error).message}`;
+          const msg = (e as Error).message;
+          why = msg.startsWith("could not probe the device")
+            ? msg
+            : `could not probe the tailnet path: ${msg}`;
         }
         return why ? { pass: false, errors: [why] } : { pass: true };
       },

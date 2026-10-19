@@ -114,8 +114,11 @@ refuses a downgrade unless `allowDowngrade: true` is passed. It also refuses
 when Tailscale is not installed, when `tailscale` and `tailscaled` report
 different versions, when the boot script is missing, when
 `/userdata` has less than 256 MB free, and (with `tailnetIp`) when the device
-does not already answer over the tailnet from the swamp host: an update that
-cannot be verified would only roll back. It:
+reports itself Running and online but does not already answer over the tailnet
+from the swamp host: an update that cannot be verified would only roll back. A
+device that is down, logged out or offline is not refused for its missing path,
+since the update may be what fixes it; it must still answer over the tailnet
+after the swap to count as done. It:
 
 1. Downloads `tailscale_<ver>_arm.tgz` and its `.sha256` from
    pkgs.tailscale.com on the swamp host, and refuses on a mismatch.
@@ -193,7 +196,7 @@ method). The first three share one SSH probe.
 | `tailscale-installed`   | Tailscale is missing, its version is unreadable, or `tailscaled` is on another version |
 | `tailscale-boot-script` | `S22tailscale` is missing                                         |
 | `userdata-free-space`   | `/userdata` free space is unreadable or under 256 MB              |
-| `tailnet-path`          | With `tailnetIp`: the device does not answer over the tailnet now |
+| `tailnet-path`          | With `tailnetIp`: the device reports itself Running and online, yet does not answer over the tailnet now |
 | `swap-not-running`      | An earlier swap is still running on the device                    |
 
 A check that cannot probe the device fails rather than passes. The method

@@ -2151,3 +2151,17 @@ Deno.test("with tailnetIp, a device that is down or logged out is not refused fo
   );
   assertEquals(ok.w.outcome, "done");
 });
+
+Deno.test("the tailnet-path check opens no SSH without tailnetIp, and fails closed when the device probe fails", async () => {
+  const lan = new FakeJetKvm({ sshDown: true });
+  assertEquals(await runCheck("tailnet-path", { "192.0.2.10": lan }), {
+    pass: true,
+  });
+  assertEquals(lan.sshLog.length, 0, "no tailnetIp: no SSH at all");
+  const r = await runCheck("tailnet-path", {
+    "192.0.2.10": new FakeJetKvm({ sshDown: true }),
+    "198.51.100.7": new FakeJetKvm(),
+  }, { host: "192.0.2.10", tailnetIp: "198.51.100.7" });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "could not probe the device");
+});
