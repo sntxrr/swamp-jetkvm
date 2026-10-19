@@ -2065,3 +2065,20 @@ Deno.test("a rollback whose old version never comes back online is rollback-fail
   const { w } = await applied(fake);
   assertEquals(w.outcome, "rollback-failed");
 });
+
+Deno.test("a rollback on a device that was offline before the update needs only Running, not online", async () => {
+  const fake = new FakeJetKvm();
+  fake.online = false; // offline before the update
+  fake.swapPlan = "stuck";
+  fake.rollbackOnline = false;
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rolled-back");
+});
+
+Deno.test("the rollback logs to its log file, never to the SSH session", () => {
+  const r = rollbackScript(OLD);
+  assertStringIncludes(
+    r,
+    'echo >>/userdata/tailscale-rollback.log 2>&1 "tailscaled did not stop in 20 s; killing it"',
+  );
+});

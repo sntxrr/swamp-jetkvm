@@ -140,7 +140,8 @@ cannot be verified would only roll back. It:
    the backup, restarts the daemon, records `rolled-back` and fails. The
    restore ignores a dropped session, kills a daemon that will not stop, and
    renames the binaries into place, so it cannot be left half-done. It counts
-   as restored only once the old version is Running and online again.
+   as restored only once the old version is Running again (and online, if it
+   was online before the update).
 6. After a verified update, removes every backup except the one it just made
    (each is about 65 MB), so the version it replaced stays restorable.
 
@@ -149,7 +150,7 @@ The `outcome` says what happened, and which ones need a human:
 | `outcome`           | Meaning                                                                   |
 | ------------------- | ------------------------------------------------------------------------- |
 | `done`              | Updated and rejoined (and, with `rebootAfter`, rejoined after a reboot)   |
-| `unchanged`         | The swap exited before touching the binaries; the device is as it was     |
+| `unchanged`         | The swap exited before touching the binaries; the message says if tailscaled is not back up |
 | `rolled-back`       | Swapped, did not rejoin (or did not answer over the tailnet), old binaries restored and running |
 | `rollback-failed`   | **Needs a human**: the restore did not bring the old version back up      |
 | `swap-unconfirmed`  | **Needs a human**: the swap was still running or unreadable at 2x timeout |

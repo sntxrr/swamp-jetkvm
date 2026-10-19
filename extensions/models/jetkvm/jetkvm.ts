@@ -1158,7 +1158,7 @@ export function rollbackScript(fromVersion: string): string {
 trap '' HUP
 trap 'pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start >>${ROLLBACK_LOG} 2>&1' EXIT
 set -e
-${stopDaemon("echo", ` >>${ROLLBACK_LOG} 2>&1`)}
+${stopDaemon(`echo >>${ROLLBACK_LOG} 2>&1`, ` >>${ROLLBACK_LOG} 2>&1`)}
 for b in tailscale tailscaled; do
   cp -p ${backup}/$b ${TS_DIR}/$b.rb
   mv ${TS_DIR}/$b.rb ${TS_DIR}/$b
@@ -1779,7 +1779,10 @@ async function runTailscale(
   const restoredRunning = (r: Probe["tailscale"] | null) =>
     r?.version === ts.version &&
     (r.daemonVersion === null || r.daemonVersion === ts.version) &&
-    r.daemonRunning && r.backendState === "Running" && r.online === true;
+    r.daemonRunning && r.backendState === "Running" &&
+    // Back online, if it was online before: a device that was already
+    // offline cannot be held to more than it had.
+    (ts.online !== true || r.online === true);
   const rbDeadline = Date.now() + args.rejoinTimeoutMs;
   while (Date.now() < rbDeadline) {
     await sleep(rejoinPoll.intervalMs);
@@ -1847,7 +1850,7 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts only once the old version is back online; health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
+        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts only once the old version is back online (if it was online before); health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
