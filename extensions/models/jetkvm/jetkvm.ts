@@ -758,8 +758,8 @@ const TailscaleSchema = z.object({
   sha256: z.string().nullable(),
   before: TailscaleStateSchema,
   after: TailscaleStateSchema.nullable(),
-  tailnet: TailnetProbeSchema.nullable().describe(
-    "The last anonymous probe of tailnetIp from the swamp host: after the swap (or the rollback, or the reboot), or before it for a refusal. Null without tailnetIp, or when the run never got that far.",
+  tailnet: TailnetProbeSchema.nullable().default(null).describe(
+    "The last anonymous probe of tailnetIp from the swamp host: after the swap (or the rollback, or the reboot), or before it for a refusal. Null without tailnetIp, before 2026.10.19.1, or when the run never got that far.",
   ),
   steps: z.array(z.string()).describe("What was (or would be) done, in order."),
 });
@@ -877,11 +877,27 @@ export function tailnetOk(p: TailnetProbe | null): boolean {
   return p === null || (p.reachable && p.sameDevice !== false);
 }
 
+/**
+ * Stricter than tailnetOk, for the update: with a pinned hostKey the key on
+ * the tailnet address must have been READ and match. health tolerates an
+ * unreadable key (sameDevice null); an update must not count it as proof.
+ */
+export function tailnetVerified(
+  p: TailnetProbe | null,
+  hostKeyPinned: boolean,
+): boolean {
+  return tailnetOk(p) &&
+    !(hostKeyPinned && p !== null && p.sameDevice === null);
+}
+
 /** One-line account of a tailnet probe, for messages. Pure. */
 export function describeTailnet(p: TailnetProbe | null): string {
   if (!p) return "no tailnetIp to probe";
   if (!p.reachable) return `${p.ip} unreachable (${p.error ?? "no answer"})`;
   if (p.sameDevice === false) return `${p.ip} is another device (${p.error})`;
+  if (p.sameDevice === null) {
+    return `${p.ip} answers, but its SSH host key could not be read`;
+  }
   return `${p.ip} answers`;
 }
 
@@ -901,14 +917,34 @@ export const checkProbeCache = {
   },
 };
 
-function probeForChecks(g: GlobalArgs): Promise<Probe> {
-  const key = `${g.host}:${g.sshPort}`;
+/** Everything that decides which device a probe reaches and how it logs in. */
+function probeKey(g: GlobalArgs): string {
+  return JSON.stringify([
+    g.host,
+    g.sshPort,
+    g.sshUser,
+    g.sshKeyFile ?? null,
+    g.hostKey ?? null,
+  ]);
+}
+
+function forgetProbe(key: string, p: Promise<Probe>) {
+  // Only our own entry: a newer probe may have replaced it since.
+  if (checkProbeCache.entries.get(key)?.p === p) {
+    checkProbeCache.entries.delete(key);
+  }
+}
+
+function probeForChecks(g: GlobalArgs): { key: string; p: Promise<Probe> } {
+  const key = probeKey(g);
   const hit = checkProbeCache.entries.get(key);
-  if (hit && Date.now() - hit.at < checkProbeCache.ttlMs) return hit.p;
+  if (hit && Date.now() - hit.at < checkProbeCache.ttlMs) {
+    return { key, p: hit.p };
+  }
   const p = probe(transportFactory.create(g));
   checkProbeCache.entries.set(key, { at: Date.now(), p });
-  p.catch(() => checkProbeCache.entries.delete(key));
-  return p;
+  p.catch(() => forgetProbe(key, p));
+  return { key, p };
 }
 
 /** Run a device-state check: probe, judge, and fail closed when the probe fails. */
@@ -917,8 +953,10 @@ async function deviceCheck(
   judge: (p: Probe) => string | null,
 ): Promise<{ pass: boolean; errors?: string[] }> {
   let p: Probe;
+  let entry: { key: string; p: Promise<Probe> };
   try {
-    p = await probeForChecks(GlobalArgsSchema.parse(rawGlobals));
+    entry = probeForChecks(GlobalArgsSchema.parse(rawGlobals));
+    p = await entry.p;
   } catch (e) {
     return {
       pass: false,
@@ -926,6 +964,8 @@ async function deviceCheck(
     };
   }
   const why = judge(p);
+  // A failing reading is not kept: the operator fixes it and re-runs at once.
+  if (why) forgetProbe(entry.key, entry.p);
   return why ? { pass: false, errors: [why] } : { pass: true };
 }
 
@@ -959,8 +999,11 @@ export function freeSpaceRefusal(p: Probe): string | null {
 }
 
 /** See installRefusal: an update the swamp host could not verify must not start. */
-export function tailnetRefusal(t: TailnetProbe | null): string | null {
-  return tailnetOk(t)
+export function tailnetRefusal(
+  t: TailnetProbe | null,
+  hostKeyPinned: boolean,
+): string | null {
+  return tailnetVerified(t, hostKeyPinned)
     ? null
     : `the tailnet path from this host is already broken (${
       describeTailnet(t)
@@ -1109,6 +1152,17 @@ export function parseSwapState(stdout: string | null): SwapState {
   };
 }
 
+/** Why an update must not start given the device's swap state; null when it may. Pure. */
+export function swapRunningRefusal(st: SwapState): string | null {
+  if (st.state === "running" || st.state === "starting") {
+    return `a Tailscale swap is already ${st.state} on the device (see ${SWAP_LOG}); wait for it to finish before starting another`;
+  }
+  if (st.state === "unknown") {
+    return "could not read whether a Tailscale swap is already running on the device";
+  }
+  return null;
+}
+
 async function swapState(t: Transport): Promise<SwapState> {
   const r = await t.ssh("sh -s", new TextEncoder().encode(SWAP_STATE_SCRIPT))
     .catch(() => null);
@@ -1117,6 +1171,12 @@ async function swapState(t: Transport): Promise<SwapState> {
 
 /** Polling cadence for the rejoin check. Exported so tests can shorten it. */
 export const rejoinPoll = { intervalMs: 3000 };
+
+/**
+ * How long a device that reports itself rejoined has to also answer over the
+ * tailnet before the update is judged failed. Exported so tests can shorten it.
+ */
+export const tailnetGrace = { ms: 45000 };
 
 interface Ctx {
   globalArgs: GlobalArgs;
@@ -1193,8 +1253,13 @@ async function runTailscale(
     message: string;
     after?: Probe["tailscale"] | null;
     sha256?: string | null;
-  }) =>
-    context.writeResource("tailscale", "tailscale", {
+  }) => {
+    context.logger.info("JetKVM {host}: tailscale {outcome}: {message}", {
+      host: g.host,
+      outcome: rec.outcome,
+      message: rec.message,
+    });
+    return context.writeResource("tailscale", "tailscale", {
       host: g.host,
       at: new Date().toISOString(),
       action: args.action,
@@ -1208,6 +1273,7 @@ async function runTailscale(
       sha256: rec.sha256 ?? null,
       tailnet: lastTailnet,
     });
+  };
   const refuse = async (why: string): Promise<never> => {
     await record({ applied: false, outcome: "refused", message: why });
     throw new Error(`tailscale ${args.action} on ${g.host}: ${why}`);
@@ -1258,8 +1324,10 @@ async function runTailscale(
   // A path that is already broken would make a good update look failed and
   // roll it back; say so up front instead.
   lastTailnet = await probeTailnet(g);
-  const path = tailnetRefusal(lastTailnet);
+  const path = tailnetRefusal(lastTailnet, Boolean(g.hostKey));
   if (path) await refuse(path);
+  const prior = swapRunningRefusal(await swapState(t));
+  if (prior) await refuse(prior);
 
   const tarball = `tailscale_${target}_arm.tgz`;
   const url = `https://pkgs.tailscale.com/stable/${tarball}`;
@@ -1391,30 +1459,51 @@ async function runTailscale(
   const confirmed = async (p: Probe["tailscale"] | null) => {
     if (!p || !rejoined(p)) return false;
     lastTailnet = await probeTailnet(g);
-    return tailnetOk(lastTailnet);
+    return tailnetVerified(lastTailnet, Boolean(g.hostKey));
+  };
+  // From here on a record must not carry the pre-swap probe: it would say
+  // "reachable" about a device that may now be down.
+  lastTailnet = null;
+  const freshTailnet = async () => {
+    if (g.tailnetIp) lastTailnet = await probeTailnet(g);
   };
   let after: Probe["tailscale"] | null = null;
   let ok = false;
   let st: SwapState = { state: "unknown", exitCode: null, log: "" };
+  // When the device first reported itself rejoined. From then the tailnet
+  // path gets tailnetGrace to answer: right after tailscaled restarts, peers
+  // do not yet have its new endpoints, and a good update must not be rolled
+  // back for that.
+  let rejoinedAt: number | null = null;
+  let lookedAgain = false;
   const started = Date.now();
   while (true) {
     await sleep(rejoinPoll.intervalMs);
     after = await probe(t).then((p) => p.tailscale).catch(() => after);
-    if ((ok = await confirmed(after))) break;
-    const elapsed = Date.now() - started;
+    if (after && rejoined(after)) {
+      rejoinedAt ??= Date.now();
+      if ((ok = await confirmed(after))) break;
+    }
+    const now = Date.now();
+    const elapsed = now - started;
     if (elapsed < args.rejoinTimeoutMs) continue;
+    if (rejoinedAt !== null) {
+      if (now < rejoinedAt + tailnetGrace.ms) continue;
+      st = await swapState(t);
+      break;
+    }
     st = await swapState(t);
+    // The state check runs after this round's probe, so a swap seen to exit
+    // just now was judged on the probe from before it finished: go round
+    // once more (and into the grace, if it rejoined) before deciding.
+    if (st.state === "exited" && !lookedAgain) {
+      lookedAgain = true;
+      continue;
+    }
     const live = st.state === "running" || st.state === "starting";
     if (!live || elapsed >= 2 * args.rejoinTimeoutMs) {
       break;
     }
-  }
-  // The state check runs after this round's probe, so a swap seen to
-  // exit just now was judged on the probe from before it finished:
-  // look once more before deciding, or a late success reads as failed.
-  if (!ok && st.state === "exited") {
-    after = await probe(t).then((p) => p.tailscale).catch(() => after);
-    ok = await confirmed(after);
   }
 
   if (ok && after) {
@@ -1437,7 +1526,6 @@ async function runTailscale(
           : ""
       }. Backup kept in ${keep}/`;
     if (!args.rebootAfter) {
-      context.logger.info("{host}: {msg}", { host: g.host, msg: done });
       const h = await record({
         applied: true,
         outcome: "done",
@@ -1451,6 +1539,7 @@ async function runTailscale(
     // 4b. Prove it also starts from the boot script. A reboot is seen as
     // a new kernel boot id; without one to compare, do not reboot.
     const unverified = async (why: string, last: Probe | null) => {
+      await freshTailnet();
       await record({
         applied: true,
         outcome: "reboot-unverified",
@@ -1498,7 +1587,6 @@ async function runTailscale(
     if (booted && sawReboot && bootOk) {
       const msg =
         `${done}. Rebooted: back after boot with ${booted.tailscale.version}, Running, online, ${booted.tailscale.ip} (uptime ${booted.uptimeSeconds}s)`;
-      context.logger.info("{host}: {msg}", { host: g.host, msg });
       const h = await record({
         applied: true,
         outcome: "done",
@@ -1525,6 +1613,8 @@ async function runTailscale(
 
   // A device that reports itself rejoined failed only on the tailnet probe:
   // name it, or the message reads as if nothing was wrong.
+  // Every record from here on is a failure: give it the path as it is now.
+  await freshTailnet();
   const last = after
     ? `${after.version}, ${after.backendState}, online=${after.online}, ip=${after.ip}${
       g.tailnetIp && rejoined(after)
@@ -1600,7 +1690,7 @@ async function runTailscale(
     restored.daemonRunning && restored.backendState === "Running";
   // Recorded, not judged: the old version is what worked before, and whether
   // its path came back says whether the new version was really the cause.
-  if (restoredOk) lastTailnet = await probeTailnet(g);
+  await freshTailnet();
   await record({
     applied: true,
     outcome: restoredOk ? "rolled-back" : "rollback-failed",
@@ -1652,7 +1742,7 @@ export const model = {
     {
       toVersion: "2026.10.19.1",
       description:
-        "No argument change. BREAKING for callers: updates moved to the new tailscaleUpdate method, behind labeled live pre-flight checks; tailscale is read-only and refuses apply: true. With tailnetIp, an update counts as rejoined only when the device also answers over the tailnet from the swamp host, and it refuses to start when that path is already broken.",
+        "No argument change. BREAKING for callers: updates moved to the new tailscaleUpdate method, behind labeled live pre-flight checks; tailscale is read-only and refuses apply: true. With tailnetIp, an update counts as rejoined only when the device also answers over the tailnet from the swamp host, and it refuses to start when that path is already broken. tailscale records gain a tailnet field (null on older records).",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1692,9 +1782,29 @@ export const model = {
       labels: ["live"],
       appliesTo: ["tailscaleUpdate"],
       execute: async (context: { globalArgs: unknown }) => {
-        const why = tailnetRefusal(
-          await probeTailnet(GlobalArgsSchema.parse(context.globalArgs)),
-        );
+        let why: string | null;
+        try {
+          const g = GlobalArgsSchema.parse(context.globalArgs);
+          why = tailnetRefusal(await probeTailnet(g), Boolean(g.hostKey));
+        } catch (e) {
+          why = `could not probe the tailnet path: ${(e as Error).message}`;
+        }
+        return why ? { pass: false, errors: [why] } : { pass: true };
+      },
+    },
+    "swap-not-running": {
+      description:
+        "No earlier Tailscale swap is still running on the device; two would race on the same staging and backup paths.",
+      labels: ["live"],
+      appliesTo: ["tailscaleUpdate"],
+      execute: async (context: { globalArgs: unknown }) => {
+        let why: string | null;
+        try {
+          const g = GlobalArgsSchema.parse(context.globalArgs);
+          why = swapRunningRefusal(await swapState(transportFactory.create(g)));
+        } catch (e) {
+          why = `could not read the swap state: ${(e as Error).message}`;
+        }
         return why ? { pass: false, errors: [why] } : { pass: true };
       },
     },
@@ -1744,7 +1854,6 @@ export const model = {
         const t = transportFactory.create(g);
         const checkedAt = new Date();
         context.logger.info("JetKVM {host}: checking health", { host: g.host });
-        context.logger.info("JetKVM {host}: health check", { host: g.host });
         const blank = {
           host: g.host,
           checkedAt: checkedAt.toISOString(),

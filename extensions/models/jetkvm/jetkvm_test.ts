@@ -29,12 +29,14 @@ import {
   SWAP_STATE_SCRIPT,
   swapScript,
   tailnetFindings,
+  tailnetGrace,
   tailnetOk,
   type Transport,
   transportFactory,
 } from "./jetkvm.ts";
 
 rejoinPoll.intervalMs = 1;
+tailnetGrace.ms = 30;
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
@@ -1312,6 +1314,7 @@ Deno.test("the tailscale plan points at tailscaleUpdate, and tailscaleUpdate tak
 Deno.test("every check is labeled live and scoped to tailscaleUpdate only", () => {
   const names = Object.keys(model.checks).sort();
   assertEquals(names, [
+    "swap-not-running",
     "tailnet-path",
     "tailscale-boot-script",
     "tailscale-installed",
@@ -1573,4 +1576,156 @@ Deno.test("without tailnetIp the update behaves as before: no tailnet probe, rec
   assertEquals(w.outcome, "done");
   assertEquals(w.tailnet, null);
   assertEquals(fake.scans.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes (2026.10.19.1)
+// ---------------------------------------------------------------------------
+
+Deno.test("failure records carry the tailnet probe taken now, never the pre-swap one", async () => {
+  // rollback-failed: still on the new version, whose tailnet path is down.
+  const a = new FakeJetKvm();
+  a.swapPlan = "stuck";
+  a.rollbackWorks = false;
+  const ra = await appliedVia(
+    a,
+    new TailnetFake(a, (l) => l.tsVersion === NEW),
+  );
+  assertEquals(ra.w.outcome, "rollback-failed");
+  assertEquals(ra.w.tailnet.reachable, false, "rollback-failed");
+
+  // swap-unconfirmed: the swap is still running and the path is down.
+  const b = new FakeJetKvm();
+  b.swapPlan = "hang";
+  const rb = await appliedVia(
+    b,
+    new TailnetFake(b, (l) => l.swap.state !== "none"),
+  );
+  assertEquals(rb.w.outcome, "swap-unconfirmed");
+  assertEquals(rb.w.tailnet.reachable, false, "swap-unconfirmed");
+
+  // reboot-unverified: dead after the reboot.
+  const c = new FakeJetKvm();
+  c.rebootOutcome = "dead";
+  const rc = await appliedVia(c, new TailnetFake(c, (l) => l.rebooted), {
+    rebootAfter: true,
+    rebootTimeoutMs: 30,
+  });
+  assertEquals(rc.w.outcome, "reboot-unverified");
+  assertEquals(rc.w.tailnet.reachable, false, "reboot-unverified");
+});
+
+Deno.test("a device that rejoins after the deadline still gets the tailnet grace, and is done", async () => {
+  const lan = new FakeJetKvm();
+  let misses = 3;
+  const tail = new TailnetFake(lan, (l) => l.tsVersion === NEW && misses-- > 0);
+  // The deadline is already past when the device first reports rejoined.
+  const { w, error } = await appliedVia(lan, tail, { rejoinTimeoutMs: 1 });
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
+});
+
+Deno.test("with hostKey pinned, an unreadable key on the tailnet address is not proof", async () => {
+  class NoKeyAfterSwap extends FakeJetKvm {
+    constructor(private lan: FakeJetKvm) {
+      super();
+    }
+    override scanHostKey(type: string): Promise<string | null> {
+      return this.lan.tsVersion === NEW
+        ? Promise.resolve(null)
+        : super.scanHostKey(type);
+    }
+  }
+  const lan = new FakeJetKvm();
+  const { w } = await appliedVia(lan, new NoKeyAfterSwap(lan));
+  assertEquals(w.outcome, "rolled-back");
+  assertStringIncludes(w.message, "SSH host key could not be read");
+});
+
+Deno.test("a swap already running refuses the update, inline and as a check", async () => {
+  const busy = new FakeJetKvm();
+  busy.swap = { state: "running", code: null, log: "backup ready" };
+  const { w, error } = await applied(busy);
+  assertStringIncludes(String(error), "already running");
+  assertEquals(w.outcome, "refused");
+  assertEquals(deviceWrites(busy).length, 0);
+
+  const r = await runCheck("swap-not-running", { "192.0.2.10": busy });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "already running");
+  assertEquals(
+    await runCheck("swap-not-running", { "192.0.2.10": new FakeJetKvm() }),
+    { pass: true },
+  );
+});
+
+Deno.test("a swapped device that comes back with a different tailnet IP is rolled back", async () => {
+  class NewIpAfterSwap extends FakeJetKvm {
+    override async ssh(c: string, i?: Uint8Array, t?: number) {
+      const r = await super.ssh(c, i, t);
+      return this.tsVersion === NEW && r.stdout.includes("ts_ip=")
+        ? {
+          ...r,
+          stdout: r.stdout.replace("ts_ip=198.51.100.7", "ts_ip=198.51.100.9"),
+        }
+        : r;
+    }
+  }
+  const { w, error } = await applied(new NewIpAfterSwap());
+  assertStringIncludes(String(error), "rolled back");
+  assertEquals(w.outcome, "rolled-back");
+});
+
+Deno.test("the check probe cache: keyed on login settings, expires, and drops failing readings", async () => {
+  const lan = new FakeJetKvm();
+  const orig = transportFactory.create;
+  transportFactory.create = () => lan;
+  try {
+    checkProbeCache.clear();
+    const run = (globals: Record<string, unknown>) =>
+      model.checks["tailscale-installed"].execute({ globalArgs: globals });
+    await run({ host: "192.0.2.10" });
+    await run({ host: "192.0.2.10", sshKeyFile: "/keys/other" });
+    assertEquals(lan.sshLog.length, 2, "a different key is a different probe");
+    await run({ host: "192.0.2.10" });
+    assertEquals(lan.sshLog.length, 2, "same settings within the TTL: cached");
+    const ttl = checkProbeCache.ttlMs;
+    checkProbeCache.ttlMs = 0;
+    try {
+      await run({ host: "192.0.2.10" });
+    } finally {
+      checkProbeCache.ttlMs = ttl;
+    }
+    assertEquals(lan.sshLog.length, 3, "expired: probed again");
+  } finally {
+    transportFactory.create = orig;
+  }
+  const low = await runCheck("userdata-free-space", {
+    "192.0.2.10": new FakeJetKvm({ probeOver: { disk: "13830232,102400" } }),
+  });
+  assertEquals(low.pass, false);
+  assertEquals(
+    checkProbeCache.entries.size,
+    0,
+    "a failing reading is not kept",
+  );
+});
+
+Deno.test("a tailscale record from before 2026.10.19.1 (no tailnet field) still parses, as null", () => {
+  const old = {
+    host: "192.0.2.10",
+    at: "2026-10-18T00:00:00Z",
+    action: "update",
+    applied: true,
+    outcome: "done",
+    message: "x",
+    fromVersion: OLD,
+    targetVersion: NEW,
+    latestVersion: NEW,
+    sha256: null,
+    before: parseProbe(probeText()).tailscale,
+    after: null,
+    steps: [],
+  };
+  assertEquals(model.resources.tailscale.schema.parse(old).tailnet, null);
 });

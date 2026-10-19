@@ -126,8 +126,11 @@ cannot be verified would only roll back. It:
 4. Polls until the node reports the new version, `Running`, online, with the
    **same tailnet IP**, which proves it is the same machine with its state
    intact. With `tailnetIp` it must also **answer over the tailnet** from the
-   swamp host (the anonymous probe `health` uses). The device's own report is
-   not enough: after a swap, a JetKVM has reported `Running` and online while
+   swamp host (the anonymous probe `health` uses; with `hostKey` pinned, the
+   key on that address must actually be read and match). Once the device
+   reports itself back, the tailnet path gets 45 s of grace even past the
+   deadline, since peers need a moment to learn a restarted node's endpoints.
+   The device's own report is not enough: after a swap, a JetKVM has reported `Running` and online while
    a peer's pings got no answer. The probe proves the path from wherever swamp
    runs, not from every peer.
 5. If that does not happen within `rejoinTimeoutMs` (default 120 s), restores
@@ -159,7 +162,7 @@ Every `tailscale` record carries `tailnet`: the last tailnet probe (after the
 swap, the rollback or the reboot; before it for a refusal), or null without
 `tailnetIp`.
 
-**Pre-flight checks.** `tailscaleUpdate` runs four checks first, all labeled
+**Pre-flight checks.** `tailscaleUpdate` runs five checks first, all labeled
 `live` and scoped to it alone (swamp runs an unscoped check before every
 method). The first three share one SSH probe.
 
@@ -169,11 +172,15 @@ method). The first three share one SSH probe.
 | `tailscale-boot-script` | `S22tailscale` is missing                                         |
 | `userdata-free-space`   | `/userdata` free space is unreadable or under 200 MB              |
 | `tailnet-path`          | With `tailnetIp`: the device does not answer over the tailnet now |
+| `swap-not-running`      | An earlier swap is still running on the device                    |
 
 A check that cannot probe the device fails rather than passes. The method
 enforces the same conditions itself, so `--skip-check-label live` only skips
 the early answer, never the guard. The downgrade refusal is not a check: it
-depends on the `version` argument, which checks only see unvalidated.
+depends on the `version` argument, which checks only see unvalidated. For the
+same reason the checks are stricter than the method on a no-op: a device that
+is already current but low on space fails `userdata-free-space`, where the
+method alone would record `current`.
 
 Use the device's **LAN address** as `host`. The update restarts tailscaled, so
 an SSH session running over the tailnet would be cut.
