@@ -164,7 +164,9 @@ counts as running only while that PID is still the swap script, and a launch
 whose PID was never written counts as starting only within the same boot. Power
 lost between the two renames leaves `tailscale` and `tailscaled` on different
 versions; `health` reports `tailscale_binaries_mismatch` and the update refuses
-until both are restored from the backup. The reboot check compares the kernel
+until both are restored from the backup. The swap never renames while
+tailscaled is still running: if the daemon does not stop within 20 s, it exits
+and the run records `unchanged`. The reboot check compares the kernel
 boot ID, and is skipped (`reboot-unverified`, no reboot) if it cannot be read
 first. The "same tailnet IP" check applies when the probe can read an IPv4
 tailnet address.

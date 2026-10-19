@@ -1920,10 +1920,27 @@ Deno.test("a swap whose daemon stayed on the old version (second rename failed) 
   assert(sent(fake, "ROLLBACK_DONE"));
 });
 
-Deno.test("the mismatch message names the exact backup: the daemon's version", () => {
-  const p = parseProbe(probeText({ ts_daemon_version: "1.96.0" }));
-  assertStringIncludes(
-    String(installRefusal(p)),
-    "/userdata/tailscale/backup-1.96.0/",
+Deno.test("the swap stops, unchanged, if tailscaled does not stop: never renames under a running daemon", () => {
+  const s = swapScript(NEW, OLD);
+  const guard = s.indexOf('log "tailscaled did not stop"; exit 5');
+  assert(guard > 0);
+  assert(
+    guard >
+      s.indexOf(
+        "${TS_BOOT} stop".replace(
+          "${TS_BOOT}",
+          "/userdata/init.d/S22tailscale",
+        ),
+      ),
   );
+  assert(guard < s.indexOf('log "swapping binaries"'));
+});
+
+Deno.test("the mismatch message names both candidate backups (a cut swap or a cut rollback)", () => {
+  const p = parseProbe(
+    probeText({ ts_version: "1.98.8", ts_daemon_version: "1.96.0" }),
+  );
+  const m = String(installRefusal(p));
+  assertStringIncludes(m, "/userdata/tailscale/backup-1.96.0/");
+  assertStringIncludes(m, "/userdata/tailscale/backup-1.98.8/");
 });

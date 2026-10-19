@@ -998,14 +998,14 @@ async function deviceCheck(
 }
 
 /**
- * The CLI and the daemon on different versions: a swap was cut between its
- * two renames (a power cut is the only way past the rollback). The probe reads
- * the CLI's version, so without this the device would look current. Pure.
+ * The CLI and the daemon on different versions: a swap or a rollback was cut
+ * between its two renames (a power cut, or a failed second rename). The probe
+ * reads the CLI's version, so without this the device would look current. Pure.
  */
 export function binariesMismatch(p: Probe): string | null {
   const { version, daemonVersion } = p.tailscale;
   if (!version || !daemonVersion || version === daemonVersion) return null;
-  return `tailscale is ${version} but tailscaled is ${daemonVersion}: a swap was cut between its two renames; restore both from ${TS_DIR}/backup-${daemonVersion}/ (tailscale is renamed first, so the daemon still has the old version) and restart tailscaled`;
+  return `tailscale is ${version} but tailscaled is ${daemonVersion}: a swap was cut between its two renames; restore both from whichever of ${TS_DIR}/backup-${daemonVersion}/ or ${TS_DIR}/backup-${version}/ exists (a cut swap leaves the daemon old, a cut rollback leaves it new) and restart tailscaled`;
 }
 
 /** Why an update must not start, judged from device facts; null when it may. Pure. */
@@ -1103,6 +1103,9 @@ cp "$src/tailscale" ${TS_DIR}/tailscale.new
 cp "$src/tailscaled" ${TS_DIR}/tailscaled.new
 ${TS_BOOT} stop || true
 i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+# Renaming under a daemon that would not stop leaves it running the old
+# binary while both files read the new version: stop here, unchanged.
+if pidof tailscaled >/dev/null 2>&1; then log "tailscaled did not stop"; exit 5; fi
 log "swapping binaries"
 mv ${TS_DIR}/tailscale.new ${TS_DIR}/tailscale
 mv ${TS_DIR}/tailscaled.new ${TS_DIR}/tailscaled
@@ -1511,8 +1514,9 @@ async function runTailscale(
   // deadline, keep waiting while the script is still running (a slow tar
   // on armv7), up to twice the timeout: deciding while it runs would
   // race it.
-  // The daemon's own version too: a failed second rename leaves the old
-  // tailscaled running beside the new CLI.
+  // tailscaled's on-disk version too: a failed second rename leaves the old
+  // binary beside the new CLI. (The swap never renames under a daemon that
+  // would not stop, so the restarted process runs the file that was read.)
   const rejoined = (p: Probe["tailscale"]) =>
     p.version === target &&
     (p.daemonVersion === null || p.daemonVersion === target) &&
