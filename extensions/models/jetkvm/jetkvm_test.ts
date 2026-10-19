@@ -13,6 +13,7 @@ import {
   describeTailnet,
   evaluateHealth,
   type HttpResult,
+  installRefusal,
   model,
   parseMetrics,
   parseProbe,
@@ -26,6 +27,7 @@ import {
   rollbackScript,
   sshArgs,
   type SshResult,
+  stopDaemon,
   SWAP_STATE_SCRIPT,
   swapScript,
   tailnetFindings,
@@ -52,6 +54,10 @@ Deno.test("sshArgs refuses unknown host keys, never prompts, and pins when given
   assertStringIncludes(plain.join(" "), "BatchMode=yes");
   assertStringIncludes(plain.join(" "), "StrictHostKeyChecking=yes");
   assertStringIncludes(plain.join(" "), "ControlPath=none");
+  // A root shell on the appliance never gets the operator's agent.
+  assertStringIncludes(plain.join(" "), "ForwardAgent=no");
+  assertStringIncludes(plain.join(" "), "ForwardX11=no");
+  assertStringIncludes(plain.join(" "), "ClearAllForwardings=yes");
   assert(!plain.join(" ").includes("UserKnownHostsFile"));
   assertEquals(plain.slice(-3), ["--", "192.0.2.10", "sh -s"]);
   assert(!plain.includes("-n"), "stdin carries the script; -n would empty it");
@@ -291,7 +297,7 @@ Deno.test("the swap script records its pid and status, cleans up and restarts th
     s,
     "mv /userdata/tailscale/backup-1.98.8.tmp /userdata/tailscale/backup-1.98.8",
   );
-  assert(s.indexOf("trap finish EXIT") < s.indexOf("set -e"));
+  assert(s.indexOf("trap finish EXIT") < s.indexOf("\nset -e\n"));
   const r = rollbackScript("1.98.8");
   assert(
     r.indexOf("backup-1.98.8/tailscale ]") < r.indexOf("S22tailscale stop"),
@@ -344,12 +350,19 @@ class FakeJetKvm implements Transport {
   uptime = 5000;
   bootId = "boot-1";
   /** ok: swaps and rejoins. stuck: swaps, never online. slow: running for `slowProbes` probes, then ok. hang: running forever. noop: exits 3 before swapping. */
-  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" | "starting" = "ok";
+  swapPlan: "ok" | "stuck" | "slow" | "hang" | "noop" | "starting" | "partial" =
+    "ok";
   slowProbes = 0;
   /** With swapPlan "starting": state checks before the swap finishes. */
   startingChecks = Infinity;
   launchCode = 0;
   rollbackWorks = true;
+  /** Whether the restored old version comes back online. */
+  rollbackOnline = true;
+  /** A backend state shown until the swap finishes (a broken device the update fixes). */
+  backendBefore: string | null = null;
+  /** The backend state the restored old version comes back in (null: Running). */
+  rollbackBackend: string | null = null;
   /** ok: reboots and comes back. dead: never answers again. noboot: back without Tailscale online. ignored: no reboot happens. */
   rebootOutcome: "ok" | "dead" | "noboot" | "ignored" = "ok";
   rebootCode = 0;
@@ -416,11 +429,12 @@ class FakeJetKvm implements Transport {
 
   private finishSwap() {
     this.tsVersion = NEW;
+    this.backendBefore = null;
     if (this.swapPlan === "stuck") this.online = false;
     this.swap = {
       state: "exited",
       code: 0,
-      log: "backup ready\nbinaries swapped\nSWAP_DONE",
+      log: "backup ready\nswapping binaries\nbinaries swapped\nSWAP_DONE",
     };
   }
 
@@ -454,6 +468,8 @@ class FakeJetKvm implements Transport {
       return this.ok(probeText(
         {
           ts_version: this.tsVersion,
+          ts_daemon_version: this.tsVersion,
+          ...(this.backendBefore ? { ts_backend: this.backendBefore } : {}),
           ts_online: String(this.online),
           uptime: String(this.uptime),
           boot_id: this.bootId,
@@ -476,7 +492,8 @@ class FakeJetKvm implements Transport {
         return { code: 3, stdout: "no complete backup", stderr: "" };
       }
       this.tsVersion = OLD;
-      this.online = true;
+      this.online = this.rollbackOnline;
+      this.backendBefore = this.rollbackBackend;
       return this.ok("ROLLBACK_DONE\n");
     }
     if (command.startsWith(`cat > /userdata/tailscale-${NEW}.tgz`)) {
@@ -498,6 +515,13 @@ class FakeJetKvm implements Transport {
         if (this.swapPlan === "starting") {
           // The redirect created the log, and sh has not written its pid yet.
           this.swap = { state: "starting", code: null, log: "" };
+        } else if (this.swapPlan === "partial") {
+          // Killed after the first rename: tailscale is new, tailscaled old.
+          this.swap = {
+            state: "exited",
+            code: 143,
+            log: "backup ready\nswapping binaries\nexit 143",
+          };
         } else if (this.swapPlan === "noop") {
           this.swap = {
             state: "exited",
@@ -1383,6 +1407,8 @@ Deno.test("each device check fails on its own condition, with the method's wordi
       ["tailscale-boot-script", { ts_boot: "0" }, "S22tailscale"],
       ["userdata-free-space", { disk: "" }, "could not read free space"],
       ["userdata-free-space", { disk: "13830232,102400" }, "100 MB free"],
+      // ~225 MB at the peak: tarball, staged copy, backup and .new copies.
+      ["userdata-free-space", { disk: "13830232,235520" }, "256 MB needed"],
     ] as const
   ) {
     const r = await runCheck(name, {
@@ -1728,4 +1754,414 @@ Deno.test("a tailscale record from before 2026.10.19.1 (no tailnet field) still 
     steps: [],
   };
   assertEquals(model.resources.tailscale.schema.parse(old).tailnet, null);
+});
+
+Deno.test("SWAP_STATE_SCRIPT on a real sh: an old log or a stale pid never reads as a swap in progress", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const script = SWAP_STATE_SCRIPT.replaceAll(
+      "/proc/sys/kernel/random/boot_id",
+      `${dir}/boot_id`,
+    ).replaceAll("/userdata", dir);
+    await Deno.writeTextFile(`${dir}/boot_id`, "boot-2\n");
+    const state = async () => {
+      const out = await new Deno.Command("sh", {
+        args: ["-c", script],
+        stdout: "piped",
+      }).output();
+      return parseSwapState(dec(out.stdout)).state;
+    };
+    assertEquals(await state(), "none");
+    // What a failed upload's cleanUp leaves: an older run's log, no script.
+    await Deno.writeTextFile(`${dir}/tailscale-update.log`, "exit 0\n");
+    assertEquals(await state(), "none", "an old log alone must not block");
+    await Deno.writeTextFile(`${dir}/tailscale-update.boot`, "boot-2\n");
+    assertEquals(await state(), "none", "no script file: nothing can start");
+    await Deno.writeTextFile(`${dir}/tailscale-update.sh`, "sleep 5\n");
+    // Power lost after the launch, before the pid: a launch from an older boot.
+    await Deno.writeTextFile(`${dir}/tailscale-update.boot`, "boot-1\n");
+    assertEquals(await state(), "none", "a launch from before a reboot");
+    await Deno.writeTextFile(`${dir}/tailscale-update.boot`, "boot-2\n");
+    assertEquals(await state(), "starting", "launched this boot, pid not yet");
+    // After a power cut the pid may belong to anything; here, this test.
+    await Deno.writeTextFile(`${dir}/tailscale-update.pid`, `${Deno.pid}\n`);
+    assertEquals(await state(), "vanished", "a live pid that is not the swap");
+    await Deno.writeTextFile(`${dir}/tailscale-update.pid`, "\n");
+    assertEquals(await state(), "vanished", "an empty pid file");
+    // /proc exists on the device (Linux); prove "running" where it can be.
+    if (await Deno.stat("/proc/self/cmdline").then(() => true, () => false)) {
+      const child = new Deno.Command("sh", {
+        args: [`${dir}/tailscale-update.sh`],
+      }).spawn();
+      try {
+        await Deno.writeTextFile(
+          `${dir}/tailscale-update.pid`,
+          `${child.pid}\n`,
+        );
+        assertEquals(await state(), "running");
+      } finally {
+        child.kill();
+        await child.status;
+      }
+    }
+    await Deno.writeTextFile(`${dir}/tailscale-update.status`, "0\n");
+    assertEquals(await state(), "exited");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("the swap script logs 'swapping binaries' before the first rename", () => {
+  const s = swapScript(NEW, OLD);
+  const mark = s.indexOf('log "swapping binaries"');
+  assert(mark > 0);
+  assert(mark < s.indexOf(`mv /userdata/tailscale/tailscale.new`));
+  assert(s.indexOf('log "binaries swapped"') > mark);
+});
+
+Deno.test("a swap that died between its two renames is rolled back, not reported unchanged", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "partial";
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "rolled back");
+  assertEquals(w.outcome, "rolled-back");
+  assert(sent(fake, "ROLLBACK_DONE"), "the backup must be restored");
+});
+
+Deno.test("a health record from before 2026.10.18.1 (no tailnet field) still parses, as null", async () => {
+  const d = await runHealth(new FakeJetKvm());
+  delete d.tailnet;
+  assertEquals(model.resources.health.schema.parse(d).tailnet, null);
+});
+
+Deno.test("tailscaleUpdate records the update instance; a later status run cannot hide it", async () => {
+  const names = async (
+    fake: FakeJetKvm,
+    method: "tailscale" | "tailscaleUpdate",
+    a: Record<string, unknown>,
+  ) => {
+    const { context, getWrittenResources } = ctx();
+    await withFake(
+      fake,
+      () =>
+        (model.methods[method].execute as any)(
+          parseArgs(method, a),
+          context as any,
+        ),
+    ).catch(() => {});
+    return getWrittenResources().map((w) => `${w.specName}/${w.name}`);
+  };
+  const stuck = new FakeJetKvm();
+  stuck.swapPlan = "stuck";
+  assertEquals(await names(stuck, "tailscaleUpdate", APPLY), [
+    "tailscale/update",
+  ]);
+  const refused = new FakeJetKvm({ probeOver: { ts_installed: "0" } });
+  assertEquals(await names(refused, "tailscaleUpdate", APPLY), [
+    "tailscale/update",
+  ]);
+  assertEquals(await names(new FakeJetKvm(), "tailscale", {}), [
+    "tailscale/tailscale",
+  ]);
+  assertEquals(
+    await names(new FakeJetKvm(), "tailscale", { action: "update" }),
+    ["tailscale/tailscale"],
+  );
+});
+
+Deno.test("a swap cut between its renames (CLI new, daemon old) is a health finding and refuses the update", async () => {
+  const fake = new FakeJetKvm({ probeOver: { ts_daemon_version: "1.96.0" } });
+  const d = await runHealth(fake);
+  const f = d.findings.find((x: any) =>
+    x.code === "tailscale_binaries_mismatch"
+  );
+  assert(f, "mismatch finding");
+  assertEquals(f.severity, "warn");
+  assertEquals(d.tailscale.daemonVersion, "1.96.0");
+  const r = await runCheck("tailscale-installed", {
+    "192.0.2.10": new FakeJetKvm({
+      probeOver: { ts_daemon_version: "1.96.0" },
+    }),
+  });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "cut between its two renames");
+  const up = new FakeJetKvm({ probeOver: { ts_daemon_version: "1.96.0" } });
+  const { w, error } = await applied(up);
+  assertEquals(w.outcome, "refused");
+  assertStringIncludes(String(error), "tailscaled is 1.96.0");
+  assertEquals(deviceWrites(up).length, 0);
+  // Unreadable daemon version: no finding, no refusal.
+  const quiet = await runHealth(
+    new FakeJetKvm({ probeOver: { ts_daemon_version: "" } }),
+  );
+  assert(
+    !quiet.findings.some((x: any) => x.code === "tailscale_binaries_mismatch"),
+  );
+});
+
+Deno.test("a download that throws is recorded as refused, and the device is untouched", async () => {
+  const fake = new FakeJetKvm();
+  const orig = fake.fetch.bind(fake);
+  fake.fetch = (url: string) =>
+    url.endsWith(".tgz") ? Promise.reject(new Error("dns error")) : orig(url);
+  const { w, error } = await applied(fake);
+  assertEquals(w.outcome, "refused");
+  assertStringIncludes(w.message, "dns error");
+  assertStringIncludes(String(error), "download");
+  assertEquals(deviceWrites(fake).length, 0);
+});
+
+Deno.test("the launch records the boot id before starting the swap; cleanUp and the write step clear it", () => {
+  const src = Deno.readTextFileSync(new URL("./jetkvm.ts", import.meta.url));
+  assertStringIncludes(
+    src,
+    "cat /proc/sys/kernel/random/boot_id > ${SWAP_BOOT} 2>/dev/null; nohup sh",
+  );
+  assertStringIncludes(src, "${SWAP_PID} ${SWAP_STATUS} ${SWAP_BOOT}`");
+  assertStringIncludes(src, "${SWAP_LOG} ${SWAP_BOOT} && cat >");
+});
+
+Deno.test("a swap whose daemon stayed on the old version (second rename failed) is rolled back, not done", async () => {
+  // The CLI reports the new version after the swap; tailscaled never changes.
+  const fake = new FakeJetKvm({ probeOver: { ts_daemon_version: OLD } });
+  const { w, error } = await applied(fake);
+  assertStringIncludes(String(error), "rolled back");
+  assertEquals(w.outcome, "rolled-back");
+  assert(sent(fake, "ROLLBACK_DONE"));
+});
+
+Deno.test("the mismatch message names both candidate backups (a cut swap or a cut rollback)", () => {
+  const p = parseProbe(
+    probeText({ ts_version: "1.98.8", ts_daemon_version: "1.96.0" }),
+  );
+  const m = String(installRefusal(p));
+  assertStringIncludes(m, "/userdata/tailscale/backup-1.96.0/");
+  assertStringIncludes(m, "/userdata/tailscale/backup-1.98.8/");
+});
+
+/**
+ * Run a device script under the host's sh against a temp dir, with tailscaled
+ * simulated: pidof, kill and the init script are shell functions over a
+ * "running" file. `stubborn` ignores the init script's stop.
+ */
+async function runOnFakeDevice(
+  script: string,
+  opts: { stubborn?: boolean; unkillable?: boolean } = {},
+) {
+  const dir = await Deno.makeTempDir();
+  const ts = `${dir}/tailscale`;
+  await Deno.mkdir(ts, { recursive: true });
+  await Deno.mkdir(`${dir}/init.d`, { recursive: true });
+  for (const b of ["tailscale", "tailscaled"]) {
+    await Deno.writeTextFile(`${ts}/${b}`, `#!/bin/sh\necho ${OLD}\n`);
+    await Deno.chmod(`${ts}/${b}`, 0o755);
+  }
+  await Deno.writeTextFile(`${dir}/running`, "");
+  await Deno.writeTextFile(`${dir}/tailscale-${NEW}.tgz`, "x");
+  const stubs = `
+pidof() { [ -f ${dir}/running ] && echo 4242; }
+kill() { [ "$1" = -9 ] && [ ! -f ${dir}/unkillable ] && rm -f ${dir}/running; echo "kill $*" >> ${dir}/calls; return 0; }
+sleep() { :; }
+tar() { d="$4/tailscale_${NEW}_arm"; mkdir -p "$d"; for b in tailscale tailscaled; do printf '#!/bin/sh\\necho ${NEW}\\n' > "$d/$b"; chmod 755 "$d/$b"; done; }
+date() { echo 00:00:00; }
+`;
+  await Deno.writeTextFile(
+    `${dir}/init.d/S22tailscale`,
+    `#!/bin/sh\necho "init $1" >> ${dir}/calls\ncase "$1" in\n  stop) ${
+      opts.stubborn ? ":" : `rm -f ${dir}/running`
+    } ;;\n  start) touch ${dir}/running ;;\nesac\n`,
+  );
+  await Deno.chmod(`${dir}/init.d/S22tailscale`, 0o755);
+  if (opts.unkillable) await Deno.writeTextFile(`${dir}/unkillable`, "");
+  const body = stubs + script.replaceAll("/userdata", dir);
+  const out = await new Deno.Command("sh", {
+    args: ["-c", body],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const read = (f: string) => Deno.readTextFile(f).catch(() => "");
+  const result = {
+    code: out.code,
+    log: dec(out.stdout),
+    calls: await read(`${dir}/calls`),
+    status: (await read(`${dir}/tailscale-update.status`)).trim(),
+    running: await Deno.stat(`${dir}/running`).then(() => true, () => false),
+    cli: await read(`${ts}/tailscale`),
+    daemon: await read(`${ts}/tailscaled`),
+  };
+  await Deno.remove(dir, { recursive: true });
+  return result;
+}
+
+Deno.test("swap on a real sh: a daemon that ignores stop is killed, swapped and restarted", async () => {
+  const r = await runOnFakeDevice(swapScript(NEW, OLD), { stubborn: true });
+  assertEquals(r.status, "0");
+  assertStringIncludes(r.log, "killing it");
+  assertStringIncludes(r.calls, "kill -9 4242");
+  assertStringIncludes(r.log, "SWAP_DONE");
+  assert(r.running, "tailscaled is started again");
+  assertStringIncludes(r.cli, NEW);
+  assertStringIncludes(r.daemon, NEW);
+});
+
+Deno.test("swap on a real sh: a normal stop needs no kill", async () => {
+  const r = await runOnFakeDevice(swapScript(NEW, OLD));
+  assertEquals(r.status, "0");
+  assert(!r.calls.includes("kill"), r.calls);
+  assert(r.running);
+  assertStringIncludes(r.daemon, NEW);
+});
+
+Deno.test("swap on a real sh: an unkillable daemon stops it before any rename, binaries untouched", async () => {
+  const r = await runOnFakeDevice(swapScript(NEW, OLD), {
+    stubborn: true,
+    unkillable: true,
+  });
+  assertEquals(r.status, "5");
+  assertStringIncludes(r.log, "survived kill -9");
+  assert(!r.log.includes("swapping binaries"));
+  assertStringIncludes(r.cli, OLD);
+  assertStringIncludes(r.daemon, OLD);
+});
+
+Deno.test("swap on a real sh: a failed restart in finish still writes the status", async () => {
+  const r = await runOnFakeDevice(
+    swapScript(NEW, OLD).replace(
+      "trap finish EXIT",
+      "trap finish EXIT\nchmod 000 /userdata/init.d/S22tailscale",
+    ),
+  );
+  assert(r.status !== "", "the status file must be written");
+});
+
+Deno.test("rollback on a real sh: a daemon that ignores stop is killed before the restore", async () => {
+  const r = await runOnFakeDevice(
+    `mkdir -p /userdata/tailscale/backup-${OLD} && cp -p /userdata/tailscale/tailscale /userdata/tailscale/tailscaled /userdata/tailscale/backup-${OLD}/\n` +
+      rollbackScript(OLD),
+    { stubborn: true },
+  );
+  assertStringIncludes(r.log, "ROLLBACK_DONE");
+  assertStringIncludes(r.calls, "kill -9 4242");
+  assert(r.running);
+});
+
+Deno.test("stopDaemon: graceful first, kill -9 only after 20 s", () => {
+  const s = stopDaemon("log");
+  assert(s.indexOf(" stop") < s.indexOf("kill -9"));
+  assertStringIncludes(s, "[ $i -lt 20 ]");
+});
+
+Deno.test("an unchanged swap that left tailscaled down says so", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "noop";
+  fake.online = true;
+  const { w } = await applied(fake, {});
+  assertEquals(w.outcome, "unchanged");
+  assert(!w.message.includes("NOT RUNNING"), w.message);
+  const down = new FakeJetKvm({ probeOver: { ts_daemon: "0" } });
+  down.swapPlan = "noop";
+  const r = await applied(down);
+  assertEquals(r.w.outcome, "unchanged");
+  assertStringIncludes(r.w.message, "TAILSCALED IS NOT RUNNING NORMALLY");
+});
+
+Deno.test("a rollback whose old version never comes back online is rollback-failed, not rolled-back", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  fake.rollbackOnline = false;
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rollback-failed");
+});
+
+Deno.test("a rollback on a device that was offline before the update needs only Running, not online", async () => {
+  const fake = new FakeJetKvm();
+  fake.online = false; // offline before the update
+  fake.swapPlan = "stuck";
+  fake.rollbackOnline = false;
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rolled-back");
+});
+
+Deno.test("the rollback logs to its log file, never to the SSH session", () => {
+  const r = rollbackScript(OLD);
+  assertStringIncludes(
+    r,
+    'echo >>/userdata/tailscale-rollback.log 2>&1 "tailscaled did not stop in 20 s; killing it"',
+  );
+});
+
+Deno.test("a device that was logged out before the update: the update may fix it, and a failed one restores without a false alarm", async () => {
+  const fixes = new FakeJetKvm();
+  fixes.backendBefore = "NeedsLogin";
+  const ok = await applied(fixes);
+  assertEquals(ok.w.outcome, "done");
+
+  const stays = new FakeJetKvm({ probeOver: { ts_backend: "NeedsLogin" } });
+  const { w } = await applied(stays);
+  assertEquals(w.outcome, "rolled-back", w.message);
+});
+
+Deno.test("a device whose daemon was down before: a failed update that restores it to down is rolled-back", async () => {
+  const fake = new FakeJetKvm({ probeOver: { ts_daemon: "0" } });
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rolled-back", w.message);
+});
+
+Deno.test("a device that was Running before, restored but not Running, is rollback-failed", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  fake.rollbackBackend = "NeedsLogin";
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rollback-failed");
+});
+
+Deno.test("with tailnetIp, a device that is down or logged out is not refused for its missing path; the update must still prove one", async () => {
+  const g = {
+    host: "192.0.2.10",
+    tailnetIp: "198.51.100.7",
+    hostKey: PINNED_KEY,
+  };
+  for (
+    const over of [
+      { ts_daemon: "0" },
+      { ts_backend: "NeedsLogin" },
+      { ts_online: "false" },
+    ] as Record<string, string>[]
+  ) {
+    const r = await runCheck("tailnet-path", {
+      "192.0.2.10": new FakeJetKvm({ probeOver: over }),
+      "198.51.100.7": new FakeJetKvm({ httpDown: true }),
+    }, g);
+    assertEquals(r.pass, true, JSON.stringify(over));
+  }
+  // The method: a logged-out device whose path is dead, fixed by the update
+  // only if the path then answers. Here it never does: rolled back, and the
+  // restore to the same logged-out state is not a false alarm.
+  const lan = new FakeJetKvm();
+  lan.backendBefore = "NeedsLogin";
+  const tail = new TailnetFake(lan, () => true); // never answers
+  const { w, error } = await appliedVia(lan, tail);
+  assertEquals(w.outcome, "rolled-back", String(error));
+  // ...and a device the update fixes, whose path then answers, is done.
+  const lan2 = new FakeJetKvm();
+  lan2.backendBefore = "NeedsLogin";
+  const ok = await appliedVia(
+    lan2,
+    new TailnetFake(lan2, (l) => l.backendBefore !== null),
+  );
+  assertEquals(ok.w.outcome, "done");
+});
+
+Deno.test("the tailnet-path check opens no SSH without tailnetIp, and fails closed when the device probe fails", async () => {
+  const lan = new FakeJetKvm({ sshDown: true });
+  assertEquals(await runCheck("tailnet-path", { "192.0.2.10": lan }), {
+    pass: true,
+  });
+  assertEquals(lan.sshLog.length, 0, "no tailnetIp: no SSH at all");
+  const r = await runCheck("tailnet-path", {
+    "192.0.2.10": new FakeJetKvm({ sshDown: true }),
+    "198.51.100.7": new FakeJetKvm(),
+  }, { host: "192.0.2.10", tailnetIp: "198.51.100.7" });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "could not probe the device");
 });
