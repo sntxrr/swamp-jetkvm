@@ -1723,7 +1723,7 @@ async function runTailscale(
 /** The `@sntxrr/jetkvm` model: health and Tailscale updates for one JetKVM. */
 export const model = {
   type: "@sntxrr/jetkvm",
-  version: "2026.10.19.1",
+  version: "2026.10.19.2",
   globalArguments: GlobalArgsSchema,
 
   upgrades: [
@@ -1743,6 +1743,12 @@ export const model = {
       toVersion: "2026.10.19.1",
       description:
         "No global-argument change. BREAKING for callers: updates moved to the new tailscaleUpdate method, behind labeled live pre-flight checks; tailscale is read-only and refuses apply: true. With tailnetIp, an update counts as rejoined only when the device also answers over the tailnet from the swamp host, and it refuses to start when that path is already broken. tailscale records gain a tailnet field (null on older records).",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.19.2",
+      description:
+        "No code or argument change. The package description now lists all five pre-flight checks (swap-not-running was missing).",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
