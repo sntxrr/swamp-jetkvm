@@ -1050,6 +1050,26 @@ export function tailnetRefusal(
     }), so a swap could not be verified and would roll back; fix that first`;
 }
 
+/**
+ * Stop tailscaled for good: the init script, 20 s of grace, then kill -9 and
+ * 5 s more. A daemon wedged in shutdown would otherwise keep running the old
+ * binary under renamed files, or hold the tunnel down with nothing to restart
+ * it. Leaves the daemon stopped unless it survives kill -9 (uninterruptible).
+ * `say` is how the calling script logs. Pure and exported for tests.
+ */
+export function stopDaemon(say: string, out = ""): string {
+  return `${TS_BOOT} stop${out} || true
+${WAIT_STOP}
+if pidof tailscaled >/dev/null 2>&1; then
+  ${say} "tailscaled did not stop in 20 s; killing it"
+  kill -9 $(pidof tailscaled) 2>/dev/null || true
+  i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done
+fi`;
+}
+
+const WAIT_STOP =
+  "i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done";
+
 /** Files the detached swap leaves on the device. The log is kept for diagnosis. */
 export const SWAP_SH = "/userdata/tailscale-update.sh";
 export const SWAP_LOG = "/userdata/tailscale-update.log";
@@ -1078,6 +1098,9 @@ export function swapScript(version: string, fromVersion: string): string {
 echo $$ > ${SWAP_PID}
 finish() {
   rc=$?
+  # Under set -e a failed start would end the trap before the status is
+  # written; the status file is what says the swap is over.
+  set +e
   rm -rf ${stage} ${tgz} ${TS_DIR}/tailscale.new ${TS_DIR}/tailscaled.new ${backup}.tmp
   pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start
   log "exit $rc"
@@ -1101,11 +1124,10 @@ fi
 log "backup ready in ${backup}"
 cp "$src/tailscale" ${TS_DIR}/tailscale.new
 cp "$src/tailscaled" ${TS_DIR}/tailscaled.new
-${TS_BOOT} stop || true
-i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
-# Renaming under a daemon that would not stop leaves it running the old
-# binary while both files read the new version: stop here, unchanged.
-if pidof tailscaled >/dev/null 2>&1; then log "tailscaled did not stop"; exit 5; fi
+${stopDaemon("log")}
+# Renaming under a live daemon leaves it running the old binary while both
+# files read the new version. Only an unkillable one gets here.
+if pidof tailscaled >/dev/null 2>&1; then log "tailscaled survived kill -9"; exit 5; fi
 log "swapping binaries"
 mv ${TS_DIR}/tailscale.new ${TS_DIR}/tailscale
 mv ${TS_DIR}/tailscaled.new ${TS_DIR}/tailscaled
@@ -1136,8 +1158,7 @@ export function rollbackScript(fromVersion: string): string {
 trap '' HUP
 trap 'pidof tailscaled >/dev/null 2>&1 || ${TS_BOOT} start >>${ROLLBACK_LOG} 2>&1' EXIT
 set -e
-${TS_BOOT} stop >>${ROLLBACK_LOG} 2>&1 || true
-i=0; while pidof tailscaled >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+${stopDaemon("echo", ` >>${ROLLBACK_LOG} 2>&1`)}
 for b in tailscale tailscaled; do
   cp -p ${backup}/$b ${TS_DIR}/$b.rb
   mv ${TS_DIR}/$b.rb ${TS_DIR}/$b
@@ -1515,8 +1536,8 @@ async function runTailscale(
   // on armv7), up to twice the timeout: deciding while it runs would
   // race it.
   // tailscaled's on-disk version too: a failed second rename leaves the old
-  // binary beside the new CLI. (The swap never renames under a daemon that
-  // would not stop, so the restarted process runs the file that was read.)
+  // binary beside the new CLI. (The swap stops the daemon, by kill -9 if it
+  // must, before renaming, so the restarted process runs the file read here.)
   const rejoined = (p: Probe["tailscale"]) =>
     p.version === target &&
     (p.daemonVersion === null || p.daemonVersion === target) &&
@@ -1719,12 +1740,17 @@ async function runTailscale(
   // unchanged. Once it logged "swapping binaries" the two may be on
   // different versions, so anything short of a rejoin restores the backup.
   if (!st.log.includes("swapping binaries")) {
+    // The binaries are untouched, but the swap stopped the daemon: say so if
+    // it is not back, or the record reads as if nothing needs doing.
+    const down = !after?.daemonRunning || after.backendState !== "Running"
+      ? "; TAILSCALED IS NOT RUNNING NORMALLY: check the device"
+      : "";
     await record({
       applied: false,
       outcome: "unchanged",
       message: `the swap exited (${st.state}${
         st.exitCode === null ? "" : ` ${st.exitCode}`
-      }) before swapping; the device is unchanged on ${ts.version} (${last}). Swap log: ${logText}`,
+      }) before swapping; the binaries are unchanged on ${ts.version} (${last})${down}. Swap log: ${logText}`,
       after,
       sha256: got,
     });
@@ -1753,7 +1779,7 @@ async function runTailscale(
   const restoredRunning = (r: Probe["tailscale"] | null) =>
     r?.version === ts.version &&
     (r.daemonVersion === null || r.daemonVersion === ts.version) &&
-    r.daemonRunning && r.backendState === "Running";
+    r.daemonRunning && r.backendState === "Running" && r.online === true;
   const rbDeadline = Date.now() + args.rejoinTimeoutMs;
   while (Date.now() < rbDeadline) {
     await sleep(rejoinPoll.intervalMs);
@@ -1821,7 +1847,7 @@ export const model = {
     {
       toVersion: "2026.10.19.2",
       description:
-        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
+        "No global-argument change. BREAKING for readers of update outcomes: tailscaleUpdate records move to their own `update` instance (data.latest(<model>, 'update')), so a status or plan run cannot hide a failed update; the read-only tailscale keeps the `tailscale` instance. Review fixes: the free-space check needs 256 MB (the .new copies were not counted); SSH never forwards the agent, X11 or ports; a stale pid or an old log no longer blocks updates; a swap that died between its two renames is rolled back instead of reported unchanged; the swap and the rollback stop tailscaled with kill -9 after 20 s rather than rename under it, and a rollback counts only once the old version is back online; health records from before 2026.10.18.1 parse. New health finding tailscale_binaries_mismatch (and a refusal) for a swap cut between its renames; a download that throws is recorded as refused.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

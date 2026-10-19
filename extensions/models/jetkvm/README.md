@@ -138,8 +138,9 @@ cannot be verified would only roll back. It:
    runs, not from every peer.
 5. If that does not happen within `rejoinTimeoutMs` (default 120 s), restores
    the backup, restarts the daemon, records `rolled-back` and fails. The
-   restore ignores a dropped session and renames the binaries into place, so a
-   daemon slow to stop cannot leave it half-done.
+   restore ignores a dropped session, kills a daemon that will not stop, and
+   renames the binaries into place, so it cannot be left half-done. It counts
+   as restored only once the old version is Running and online again.
 6. After a verified update, removes every backup except the one it just made
    (each is about 65 MB), so the version it replaced stays restorable.
 
@@ -164,9 +165,10 @@ counts as running only while that PID is still the swap script, and a launch
 whose PID was never written counts as starting only within the same boot. Power
 lost between the two renames leaves `tailscale` and `tailscaled` on different
 versions; `health` reports `tailscale_binaries_mismatch` and the update refuses
-until both are restored from the backup. The swap never renames while
-tailscaled is still running: if the daemon does not stop within 20 s, it exits
-and the run records `unchanged`. The reboot check compares the kernel
+until both are restored from the backup. The swap and the rollback never
+rename under a running daemon: after 20 s of grace they `kill -9` it, and the
+swap gives up (`unchanged`, binaries untouched) only if the daemon survives
+that. An `unchanged` record says so when tailscaled is not back up afterwards. The reboot check compares the kernel
 boot ID, and is skipped (`reboot-unverified`, no reboot) if it cannot be read
 first. The "same tailnet IP" check applies when the probe can read an IPv4
 tailnet address.

@@ -27,6 +27,7 @@ import {
   rollbackScript,
   sshArgs,
   type SshResult,
+  stopDaemon,
   SWAP_STATE_SCRIPT,
   swapScript,
   tailnetFindings,
@@ -296,7 +297,7 @@ Deno.test("the swap script records its pid and status, cleans up and restarts th
     s,
     "mv /userdata/tailscale/backup-1.98.8.tmp /userdata/tailscale/backup-1.98.8",
   );
-  assert(s.indexOf("trap finish EXIT") < s.indexOf("set -e"));
+  assert(s.indexOf("trap finish EXIT") < s.indexOf("\nset -e\n"));
   const r = rollbackScript("1.98.8");
   assert(
     r.indexOf("backup-1.98.8/tailscale ]") < r.indexOf("S22tailscale stop"),
@@ -356,6 +357,8 @@ class FakeJetKvm implements Transport {
   startingChecks = Infinity;
   launchCode = 0;
   rollbackWorks = true;
+  /** Whether the restored old version comes back online. */
+  rollbackOnline = true;
   /** ok: reboots and comes back. dead: never answers again. noboot: back without Tailscale online. ignored: no reboot happens. */
   rebootOutcome: "ok" | "dead" | "noboot" | "ignored" = "ok";
   rebootCode = 0;
@@ -483,7 +486,7 @@ class FakeJetKvm implements Transport {
         return { code: 3, stdout: "no complete backup", stderr: "" };
       }
       this.tsVersion = OLD;
-      this.online = true;
+      this.online = this.rollbackOnline;
       return this.ok("ROLLBACK_DONE\n");
     }
     if (command.startsWith(`cat > /userdata/tailscale-${NEW}.tgz`)) {
@@ -1920,22 +1923,6 @@ Deno.test("a swap whose daemon stayed on the old version (second rename failed) 
   assert(sent(fake, "ROLLBACK_DONE"));
 });
 
-Deno.test("the swap stops, unchanged, if tailscaled does not stop: never renames under a running daemon", () => {
-  const s = swapScript(NEW, OLD);
-  const guard = s.indexOf('log "tailscaled did not stop"; exit 5');
-  assert(guard > 0);
-  assert(
-    guard >
-      s.indexOf(
-        "${TS_BOOT} stop".replace(
-          "${TS_BOOT}",
-          "/userdata/init.d/S22tailscale",
-        ),
-      ),
-  );
-  assert(guard < s.indexOf('log "swapping binaries"'));
-});
-
 Deno.test("the mismatch message names both candidate backups (a cut swap or a cut rollback)", () => {
   const p = parseProbe(
     probeText({ ts_version: "1.98.8", ts_daemon_version: "1.96.0" }),
@@ -1943,4 +1930,138 @@ Deno.test("the mismatch message names both candidate backups (a cut swap or a cu
   const m = String(installRefusal(p));
   assertStringIncludes(m, "/userdata/tailscale/backup-1.96.0/");
   assertStringIncludes(m, "/userdata/tailscale/backup-1.98.8/");
+});
+
+/**
+ * Run a device script under the host's sh against a temp dir, with tailscaled
+ * simulated: pidof, kill and the init script are shell functions over a
+ * "running" file. `stubborn` ignores the init script's stop.
+ */
+async function runOnFakeDevice(
+  script: string,
+  opts: { stubborn?: boolean; unkillable?: boolean } = {},
+) {
+  const dir = await Deno.makeTempDir();
+  const ts = `${dir}/tailscale`;
+  await Deno.mkdir(ts, { recursive: true });
+  await Deno.mkdir(`${dir}/init.d`, { recursive: true });
+  for (const b of ["tailscale", "tailscaled"]) {
+    await Deno.writeTextFile(`${ts}/${b}`, `#!/bin/sh\necho ${OLD}\n`);
+    await Deno.chmod(`${ts}/${b}`, 0o755);
+  }
+  await Deno.writeTextFile(`${dir}/running`, "");
+  await Deno.writeTextFile(`${dir}/tailscale-${NEW}.tgz`, "x");
+  const stubs = `
+pidof() { [ -f ${dir}/running ] && echo 4242; }
+kill() { [ "$1" = -9 ] && [ ! -f ${dir}/unkillable ] && rm -f ${dir}/running; echo "kill $*" >> ${dir}/calls; return 0; }
+sleep() { :; }
+tar() { d="$4/tailscale_${NEW}_arm"; mkdir -p "$d"; for b in tailscale tailscaled; do printf '#!/bin/sh\\necho ${NEW}\\n' > "$d/$b"; chmod 755 "$d/$b"; done; }
+date() { echo 00:00:00; }
+`;
+  await Deno.writeTextFile(
+    `${dir}/init.d/S22tailscale`,
+    `#!/bin/sh\necho "init $1" >> ${dir}/calls\ncase "$1" in\n  stop) ${
+      opts.stubborn ? ":" : `rm -f ${dir}/running`
+    } ;;\n  start) touch ${dir}/running ;;\nesac\n`,
+  );
+  await Deno.chmod(`${dir}/init.d/S22tailscale`, 0o755);
+  if (opts.unkillable) await Deno.writeTextFile(`${dir}/unkillable`, "");
+  const body = stubs + script.replaceAll("/userdata", dir);
+  const out = await new Deno.Command("sh", {
+    args: ["-c", body],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const read = (f: string) => Deno.readTextFile(f).catch(() => "");
+  const result = {
+    code: out.code,
+    log: dec(out.stdout),
+    calls: await read(`${dir}/calls`),
+    status: (await read(`${dir}/tailscale-update.status`)).trim(),
+    running: await Deno.stat(`${dir}/running`).then(() => true, () => false),
+    cli: await read(`${ts}/tailscale`),
+    daemon: await read(`${ts}/tailscaled`),
+  };
+  await Deno.remove(dir, { recursive: true });
+  return result;
+}
+
+Deno.test("swap on a real sh: a daemon that ignores stop is killed, swapped and restarted", async () => {
+  const r = await runOnFakeDevice(swapScript(NEW, OLD), { stubborn: true });
+  assertEquals(r.status, "0");
+  assertStringIncludes(r.log, "killing it");
+  assertStringIncludes(r.calls, "kill -9 4242");
+  assertStringIncludes(r.log, "SWAP_DONE");
+  assert(r.running, "tailscaled is started again");
+  assertStringIncludes(r.cli, NEW);
+  assertStringIncludes(r.daemon, NEW);
+});
+
+Deno.test("swap on a real sh: a normal stop needs no kill", async () => {
+  const r = await runOnFakeDevice(swapScript(NEW, OLD));
+  assertEquals(r.status, "0");
+  assert(!r.calls.includes("kill"), r.calls);
+  assert(r.running);
+  assertStringIncludes(r.daemon, NEW);
+});
+
+Deno.test("swap on a real sh: an unkillable daemon stops it before any rename, binaries untouched", async () => {
+  const r = await runOnFakeDevice(swapScript(NEW, OLD), {
+    stubborn: true,
+    unkillable: true,
+  });
+  assertEquals(r.status, "5");
+  assertStringIncludes(r.log, "survived kill -9");
+  assert(!r.log.includes("swapping binaries"));
+  assertStringIncludes(r.cli, OLD);
+  assertStringIncludes(r.daemon, OLD);
+});
+
+Deno.test("swap on a real sh: a failed restart in finish still writes the status", async () => {
+  const r = await runOnFakeDevice(
+    swapScript(NEW, OLD).replace(
+      "trap finish EXIT",
+      "trap finish EXIT\nchmod 000 /userdata/init.d/S22tailscale",
+    ),
+  );
+  assert(r.status !== "", "the status file must be written");
+});
+
+Deno.test("rollback on a real sh: a daemon that ignores stop is killed before the restore", async () => {
+  const r = await runOnFakeDevice(
+    `mkdir -p /userdata/tailscale/backup-${OLD} && cp -p /userdata/tailscale/tailscale /userdata/tailscale/tailscaled /userdata/tailscale/backup-${OLD}/\n` +
+      rollbackScript(OLD),
+    { stubborn: true },
+  );
+  assertStringIncludes(r.log, "ROLLBACK_DONE");
+  assertStringIncludes(r.calls, "kill -9 4242");
+  assert(r.running);
+});
+
+Deno.test("stopDaemon: graceful first, kill -9 only after 20 s", () => {
+  const s = stopDaemon("log");
+  assert(s.indexOf(" stop") < s.indexOf("kill -9"));
+  assertStringIncludes(s, "[ $i -lt 20 ]");
+});
+
+Deno.test("an unchanged swap that left tailscaled down says so", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "noop";
+  fake.online = true;
+  const { w } = await applied(fake, {});
+  assertEquals(w.outcome, "unchanged");
+  assert(!w.message.includes("NOT RUNNING"), w.message);
+  const down = new FakeJetKvm({ probeOver: { ts_daemon: "0" } });
+  down.swapPlan = "noop";
+  const r = await applied(down);
+  assertEquals(r.w.outcome, "unchanged");
+  assertStringIncludes(r.w.message, "TAILSCALED IS NOT RUNNING NORMALLY");
+});
+
+Deno.test("a rollback whose old version never comes back online is rollback-failed, not rolled-back", async () => {
+  const fake = new FakeJetKvm();
+  fake.swapPlan = "stuck";
+  fake.rollbackOnline = false;
+  const { w } = await applied(fake);
+  assertEquals(w.outcome, "rollback-failed");
 });
