@@ -8,7 +8,9 @@ import {
 } from "jsr:@std/assert@1";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20260928.39";
 import {
+  checkProbeCache,
   compareVersions,
+  describeTailnet,
   evaluateHealth,
   type HttpResult,
   model,
@@ -27,6 +29,7 @@ import {
   SWAP_STATE_SCRIPT,
   swapScript,
   tailnetFindings,
+  tailnetOk,
   type Transport,
   transportFactory,
 } from "./jetkvm.ts";
@@ -645,18 +648,26 @@ Deno.test("health with SSH up and HTTP down is at least warn", async () => {
 // tailscale
 // ---------------------------------------------------------------------------
 
-const runTs = (fake: FakeJetKvm, a: Record<string, unknown>) => {
+const runTs = (
+  fake: FakeJetKvm,
+  a: Record<string, unknown>,
+  method: "tailscale" | "tailscaleUpdate" = "tailscale",
+) => {
   const { context, getWrittenResources } = ctx();
   const p = withFake(
     fake,
     () =>
-      model.methods.tailscale.execute(
-        parseArgs("tailscale", a),
+      (model.methods[method].execute as any)(
+        parseArgs(method, a),
         context as any,
       ),
   );
   return { p, written: () => getWrittenResources().map((w) => w.data as any) };
 };
+
+/** tailscaleUpdate: the only method that writes. */
+const runUpd = (fake: FakeJetKvm, a: Record<string, unknown>) =>
+  runTs(fake, a, "tailscaleUpdate");
 
 /** Everything sent to the device except the read-only probe and swap-state reads. */
 const deviceWrites = (fake: FakeJetKvm) =>
@@ -669,10 +680,10 @@ const sent = (fake: FakeJetKvm, needle: string) =>
     l.command.includes(needle) || l.stdin.includes(needle)
   );
 
-const APPLY = { action: "update", apply: true, rejoinTimeoutMs: 40 };
+const APPLY = { rejoinTimeoutMs: 40 };
 
 async function applied(fake: FakeJetKvm, extra: Record<string, unknown> = {}) {
-  const r = runTs(fake, { ...APPLY, ...extra });
+  const r = runUpd(fake, { ...APPLY, ...extra });
   let error: Error | null = null;
   await r.p.catch((e) => (error = e));
   const [w] = r.written();
@@ -847,13 +858,13 @@ Deno.test("a launch that failed with no trace on the device is refused and clean
 Deno.test("tailscale update is a no-op when already current, and refuses downgrades", async () => {
   const cur = new FakeJetKvm();
   cur.tsVersion = NEW;
-  const a = runTs(cur, APPLY);
+  const a = runUpd(cur, APPLY);
   await a.p;
   assertEquals(a.written()[0].outcome, "current");
   assertEquals(deviceWrites(cur).length, 0);
 
   const down = new FakeJetKvm();
-  const b = runTs(down, { ...APPLY, version: "1.90.0" });
+  const b = runUpd(down, { ...APPLY, version: "1.90.0" });
   await assertRejects(() => b.p, Error, "older than");
   assertEquals(deviceWrites(down).length, 0);
 });
@@ -867,7 +878,7 @@ Deno.test("tailscale update refuses without the boot script, an install, or a re
     ] as const
   ) {
     const fake = new FakeJetKvm({ probeOver: over });
-    const r = runTs(fake, APPLY);
+    const r = runUpd(fake, APPLY);
     await assertRejects(() => r.p, Error, msg);
     assertEquals(deviceWrites(fake).length, 0, msg);
     assert(!fake.fetchLog.some((u) => u.endsWith(".tgz")), msg);
@@ -1272,4 +1283,294 @@ Deno.test("a swap still 'starting' at the deadline is waited for, and its comple
   const { w, error } = await applied(fake);
   assertEquals(error, null);
   assertEquals(w.outcome, "done");
+});
+
+// ---------------------------------------------------------------------------
+// 2026.10.19.1: reads and writes split; labeled pre-flight checks
+// ---------------------------------------------------------------------------
+
+Deno.test("tailscale refuses apply: true loudly and touches nothing", async () => {
+  const fake = new FakeJetKvm();
+  const r = runTs(fake, { action: "update", apply: true });
+  await assertRejects(() => r.p, Error, "tailscaleUpdate");
+  assertEquals(fake.sshLog.length, 0, "a refused call must not even probe");
+  assertEquals(r.written().length, 0);
+});
+
+Deno.test("the tailscale plan points at tailscaleUpdate, and tailscaleUpdate takes no apply or action", async () => {
+  const fake = new FakeJetKvm();
+  const r = runTs(fake, { action: "update" });
+  await r.p;
+  assertStringIncludes(r.written()[0].message, "call tailscaleUpdate");
+  const shape = model.methods.tailscaleUpdate.arguments.shape as Record<
+    string,
+    unknown
+  >;
+  assert(!("apply" in shape) && !("action" in shape));
+});
+
+Deno.test("every check is labeled live and scoped to tailscaleUpdate only", () => {
+  const names = Object.keys(model.checks).sort();
+  assertEquals(names, [
+    "tailnet-path",
+    "tailscale-boot-script",
+    "tailscale-installed",
+    "userdata-free-space",
+  ]);
+  for (const [n, c] of Object.entries(model.checks)) {
+    // An unscoped swamp check runs before EVERY method, health included.
+    assertEquals(c.appliesTo, ["tailscaleUpdate"], n);
+    assert(c.labels.includes("live"), n);
+  }
+});
+
+const runCheck = async (
+  name: keyof typeof model.checks,
+  fakes: Record<string, FakeJetKvm>,
+  globals: Record<string, unknown> = { host: "192.0.2.10" },
+) => {
+  checkProbeCache.clear();
+  const orig = transportFactory.create;
+  transportFactory.create = (g) => {
+    const f = fakes[g.host];
+    if (!f) throw new Error(`no fake for ${g.host}`);
+    return f;
+  };
+  try {
+    return await model.checks[name].execute({ globalArgs: globals });
+  } finally {
+    transportFactory.create = orig;
+  }
+};
+
+Deno.test("checks pass on a healthy device and share one probe", async () => {
+  const lan = new FakeJetKvm();
+  checkProbeCache.clear();
+  for (
+    const n of [
+      "tailscale-installed",
+      "tailscale-boot-script",
+      "userdata-free-space",
+    ] as const
+  ) {
+    const orig = transportFactory.create;
+    transportFactory.create = () => lan;
+    try {
+      assertEquals(
+        await model.checks[n].execute({ globalArgs: { host: "192.0.2.10" } }),
+        { pass: true },
+        n,
+      );
+    } finally {
+      transportFactory.create = orig;
+    }
+  }
+  assertEquals(lan.sshLog.length, 1, "three checks, one SSH probe");
+  assertEquals(
+    await runCheck("tailnet-path", { "192.0.2.10": lan }),
+    { pass: true },
+    "no tailnetIp: nothing to check against",
+  );
+});
+
+Deno.test("each device check fails on its own condition, with the method's wording", async () => {
+  for (
+    const [name, over, msg] of [
+      ["tailscale-installed", { ts_installed: "0" }, "not installed"],
+      ["tailscale-boot-script", { ts_boot: "0" }, "S22tailscale"],
+      ["userdata-free-space", { disk: "" }, "could not read free space"],
+      ["userdata-free-space", { disk: "13830232,102400" }, "100 MB free"],
+    ] as const
+  ) {
+    const r = await runCheck(name, {
+      "192.0.2.10": new FakeJetKvm({ probeOver: over }),
+    });
+    assertEquals(r.pass, false, name);
+    assertStringIncludes(r.errors![0], msg, name);
+  }
+});
+
+Deno.test("a device check fails closed when the probe fails, and the failure is not cached", async () => {
+  const down = new FakeJetKvm({ sshDown: true });
+  const r = await runCheck("tailscale-installed", { "192.0.2.10": down });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "could not probe");
+  await Promise.resolve();
+  assertEquals(checkProbeCache.entries.size, 0);
+});
+
+Deno.test("the tailnet-path check fails on an unreachable or wrong device, passes on the right one", async () => {
+  const g = {
+    host: "192.0.2.10",
+    tailnetIp: "198.51.100.7",
+    hostKey: PINNED_KEY,
+  };
+  const lan = new FakeJetKvm();
+  assertEquals(
+    await runCheck("tailnet-path", {
+      "192.0.2.10": lan,
+      "198.51.100.7": new FakeJetKvm(),
+    }, g),
+    { pass: true },
+  );
+  const dead = await runCheck("tailnet-path", {
+    "192.0.2.10": lan,
+    "198.51.100.7": new FakeJetKvm({ httpDown: true }),
+  }, g);
+  assertEquals(dead.pass, false);
+  assertStringIncludes(dead.errors![0], "already broken");
+  const other = await runCheck("tailnet-path", {
+    "192.0.2.10": lan,
+    "198.51.100.7": new FakeJetKvm({
+      scannedKey:
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTHERKEYOTHERKEYOTHERKEYOTHERKEYOTHERKEYOTH",
+    }),
+  }, g);
+  assertEquals(other.pass, false);
+});
+
+Deno.test("tailnetOk and describeTailnet", () => {
+  const ip = "198.51.100.7";
+  assert(tailnetOk(null));
+  assert(tailnetOk({ ip, reachable: true, sameDevice: null, error: null }));
+  assert(tailnetOk({ ip, reachable: true, sameDevice: true, error: null }));
+  assert(!tailnetOk({ ip, reachable: true, sameDevice: false, error: "x" }));
+  assert(!tailnetOk({ ip, reachable: false, sameDevice: null, error: "x" }));
+  assertStringIncludes(
+    describeTailnet({
+      ip,
+      reachable: false,
+      sameDevice: null,
+      error: "curl exit 28",
+    }),
+    "unreachable (curl exit 28)",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The tailnet is part of "rejoined" (2026-10-19: the device said online, a peer
+// could not reach it)
+// ---------------------------------------------------------------------------
+
+/** The tailnet side of a device: answers or not depending on the LAN fake's state. */
+class TailnetFake extends FakeJetKvm {
+  constructor(
+    private lan: FakeJetKvm,
+    private downWhen: (lan: FakeJetKvm) => boolean,
+  ) {
+    super();
+  }
+  override device(path: string): Promise<HttpResult> {
+    return this.downWhen(this.lan)
+      ? Promise.reject(new Error("curl exit 28: connection timed out"))
+      : super.device(path);
+  }
+}
+
+async function appliedVia(
+  lan: FakeJetKvm,
+  tail: FakeJetKvm,
+  extra: Record<string, unknown> = {},
+) {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: model.globalArguments.parse({
+      host: "192.0.2.10",
+      tailnetIp: "198.51.100.7",
+      hostKey: PINNED_KEY,
+    }),
+  });
+  const orig = transportFactory.create;
+  transportFactory.create = (g) => (g.host === "198.51.100.7" ? tail : lan);
+  let error: Error | null = null;
+  try {
+    await model.methods.tailscaleUpdate.execute(
+      parseArgs("tailscaleUpdate", { ...APPLY, ...extra }),
+      context as any,
+    ).catch((e) => (error = e));
+  } finally {
+    transportFactory.create = orig;
+  }
+  const [w] = getWrittenResources().map((x) => x.data as any);
+  model.resources.tailscale.schema.parse(w);
+  return { w, error: error as Error | null };
+}
+
+Deno.test("a swap the device reports as rejoined, but that does not answer over the tailnet, is rolled back", async () => {
+  const lan = new FakeJetKvm(); // swaps, comes back Running + online, same IP
+  const tail = new TailnetFake(lan, (l) => l.tsVersion === NEW);
+  const { w, error } = await appliedVia(lan, tail);
+  assertStringIncludes(String(error), "rolled back");
+  assertEquals(w.outcome, "rolled-back");
+  assertEquals(w.after.version, OLD);
+  assertStringIncludes(
+    w.message,
+    "but tailnet from this host: 198.51.100.7 unreachable",
+  );
+  // After the restore the old version answers again, and the record says so.
+  assertEquals(w.tailnet.reachable, true);
+  assert(
+    !lan.sshLog.some((l) => l.command.includes("backup-*")),
+    "no prune without a verified update",
+  );
+  assertEquals(tail.sshLog.length, 0, "the tailnet side is never logged into");
+});
+
+Deno.test("an update whose tailnet path is already broken is refused before anything is downloaded", async () => {
+  const lan = new FakeJetKvm();
+  const { w, error } = await appliedVia(
+    lan,
+    new FakeJetKvm({ httpDown: true }),
+  );
+  assertStringIncludes(String(error), "already broken");
+  assertEquals(w.outcome, "refused");
+  assertEquals(w.tailnet.reachable, false);
+  assertEquals(deviceWrites(lan).length, 0);
+  assert(!lan.fetchLog.some((u) => u.endsWith(".tgz")));
+});
+
+Deno.test("with the tailnet answering, the update is done and the record carries the probe", async () => {
+  const lan = new FakeJetKvm();
+  const { w, error } = await appliedVia(lan, new TailnetFake(lan, () => false));
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
+  assertEquals(w.tailnet, {
+    ip: "198.51.100.7",
+    reachable: true,
+    sameDevice: true,
+    error: null,
+  });
+  assertStringIncludes(
+    w.message,
+    "tailnet from this host: 198.51.100.7 answers",
+  );
+});
+
+Deno.test("a tailnet path that comes back within the rejoin window still counts as done", async () => {
+  const lan = new FakeJetKvm();
+  let misses = 3;
+  const tail = new TailnetFake(lan, (l) => l.tsVersion === NEW && misses-- > 0);
+  const { w, error } = await appliedVia(lan, tail, { rejoinTimeoutMs: 400 });
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
+});
+
+Deno.test("rebootAfter: back after boot but not answering over the tailnet is reboot-unverified", async () => {
+  const lan = new FakeJetKvm();
+  const tail = new TailnetFake(lan, (l) => l.rebooted);
+  const { w, error } = await appliedVia(lan, tail, {
+    rebootAfter: true,
+    rebootTimeoutMs: 30,
+  });
+  assertStringIncludes(String(error), "update applied, but");
+  assertEquals(w.outcome, "reboot-unverified");
+  assertStringIncludes(w.message, "tailnet: 198.51.100.7 unreachable");
+});
+
+Deno.test("without tailnetIp the update behaves as before: no tailnet probe, record tailnet null", async () => {
+  const fake = new FakeJetKvm();
+  const { w, error } = await applied(fake);
+  assertEquals(error, null);
+  assertEquals(w.outcome, "done");
+  assertEquals(w.tailnet, null);
+  assertEquals(fake.scans.length, 0);
 });
