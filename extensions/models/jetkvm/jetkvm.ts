@@ -1742,7 +1742,7 @@ export const model = {
     {
       toVersion: "2026.10.19.1",
       description:
-        "No argument change. BREAKING for callers: updates moved to the new tailscaleUpdate method, behind labeled live pre-flight checks; tailscale is read-only and refuses apply: true. With tailnetIp, an update counts as rejoined only when the device also answers over the tailnet from the swamp host, and it refuses to start when that path is already broken. tailscale records gain a tailnet field (null on older records).",
+        "No global-argument change. BREAKING for callers: updates moved to the new tailscaleUpdate method, behind labeled live pre-flight checks; tailscale is read-only and refuses apply: true. With tailnetIp, an update counts as rejoined only when the device also answers over the tailnet from the swamp host, and it refuses to start when that path is already broken. tailscale records gain a tailnet field (null on older records).",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

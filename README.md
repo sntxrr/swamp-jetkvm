@@ -10,10 +10,11 @@ SDK.
 
 Health checks and Tailscale updates for one JetKVM per model instance.
 
-| Method      | Writes?          | What it does                                                    |
-| ----------- | ---------------- | --------------------------------------------------------------- |
-| `health`    | no               | Reachability, firmware and Tailscale currency, USB, disk, clock |
-| `tailscale` | **with `apply`** | Status, or update Tailscale with verified rollback              |
+| Method            | Writes?    | What it does                                                    |
+| ----------------- | ---------- | --------------------------------------------------------------- |
+| `health`          | no         | Reachability, firmware and Tailscale currency, USB, disk, clock |
+| `tailscale`       | no         | Tailscale status, or the plan for an update                     |
+| `tailscaleUpdate` | **always** | Update Tailscale with verified rollback                         |
 
 JetKVM keeps almost everything behind a WebRTC data channel, and the device has
 no CA store, so `tailscale update` cannot run on it. The

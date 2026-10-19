@@ -176,7 +176,9 @@ method). The first three share one SSH probe.
 
 A check that cannot probe the device fails rather than passes. The method
 enforces the same conditions itself, so `--skip-check-label live` only skips
-the early answer, never the guard. The downgrade refusal is not a check: it
+the early answer, never the guard. A refusal by a check leaves no `tailscale` record (checks cannot
+write data): the check's error is its only trace. `tailscale` action update
+records the same refusal as a plan. The downgrade refusal is not a check: it
 depends on the `version` argument, which checks only see unvalidated. For the
 same reason the checks are stricter than the method on a no-op: a device that
 is already current but low on space fails `userdata-free-space`, where the
